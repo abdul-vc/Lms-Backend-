@@ -249,7 +249,7 @@ def upload_hero_image(request):
     saved_path = default_storage.save(unique_name, file)
 
     # Build absolute URL the frontend can use directly
-    url = request.build_absolute_uri(f'/media/{saved_path}')
+    url = request.build_absolute_uri(f'/api/media/{saved_path}')
 
     return Response({'url': url, 'path': saved_path}, status=status.HTTP_201_CREATED)
 

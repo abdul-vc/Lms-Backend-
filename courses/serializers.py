@@ -117,6 +117,9 @@ class CourseSerializer(serializers.ModelSerializer):
                 if url.startswith(dev_prefix):
                     url = url[len(dev_prefix):]
                     break
+            if not url.startswith('/api/media/') and (url.startswith('/media/') or url.startswith('media/')):
+                clean_path = url if url.startswith('/') else f'/{url}'
+                url = f"/api{clean_path}"
             if not (url.startswith("http://") or url.startswith("https://")):
                 if request is not None:
                     ret["hero_url"] = request.build_absolute_uri(url)
