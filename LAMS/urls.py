@@ -172,6 +172,12 @@ urlpatterns = [
     path('api/', include('import_engine.urls')),
     path('api/', include('scorm_export.urls')),
     # Custom endpoints for streaming video and SCORM packages with CORS
+    path('api/media/scorm/<path:path>', serve_scorm_media),
+    path('api/media/course_videos/<path:path>', serve_media_video),
+    re_path(r'^api/media/(?P<path>.*\.mp4)$', serve_media_video),
+    re_path(r'^api/media/(?P<path>.*\.webm)$', serve_media_video),
+    re_path(r'^api/media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
+
     path('media/scorm/<path:path>', serve_scorm_media, name='serve_scorm_media'),
     path('media/course_videos/<path:path>', serve_media_video, name='serve_media_video'),
     re_path(r'^media/(?P<path>.*\.mp4)$', serve_media_video),
