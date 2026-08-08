@@ -1,0 +1,24 @@
+# Backend .gitignore
+.env
+.env.local
+.env.*.local
+*.env
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.sqlite3
+db.sqlite3
+media/
+
+audit_out.txt
+*.log
+logs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+venv/
+.venv/
+env/
