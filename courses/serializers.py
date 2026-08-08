@@ -108,22 +108,38 @@ class CourseSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         ret = super().to_representation(instance)
         request = self.context.get('request')
-        if request:
-           if ret.get("hero_url"):
-              if not (
-                ret["hero_url"].startswith("http://")
-                or ret["hero_url"].startswith("https://")
-              ):
-                ret["hero_url"] = request.build_absolute_uri(ret["hero_url"])
-              else:
-                    ret['hero_url'] = request.build_absolute_uri(ret["hero_url"])
+        if ret.get("hero_url"):
+            url = str(ret["hero_url"]).strip()
+            for dev_prefix in ['http://127.0.0.1:8000', 'https://127.0.0.1:8000', 'http://localhost:8000', 'https://localhost:8000']:
+                if url.startswith(dev_prefix):
+                    url = url[len(dev_prefix):]
+                    break
+            if not (url.startswith("http://") or url.startswith("https://")):
+                if request is not None:
+                    ret["hero_url"] = request.build_absolute_uri(url)
+                else:
+                    frontend_url = getattr(settings, 'FRONTEND_URL', 'https://lms.vibesandbox.live').rstrip('/')
+                    ret["hero_url"] = f"{frontend_url}{url}"
+            else:
+                ret["hero_url"] = url
 
         if hasattr(instance, 'scorm_package') and instance.scorm_package:
             sp = instance.scorm_package
             launch_url = sp.launch_url
-            if launch_url and not (launch_url.startswith('http://') or launch_url.startswith('https://')):
-                if request is not None:
-                    launch_url = request.build_absolute_uri(launch_url)
+            if launch_url:
+                l_url = str(launch_url).strip()
+                for dev_prefix in ['http://127.0.0.1:8000', 'https://127.0.0.1:8000', 'http://localhost:8000', 'https://localhost:8000']:
+                    if l_url.startswith(dev_prefix):
+                        l_url = l_url[len(dev_prefix):]
+                        break
+                if not (l_url.startswith('http://') or l_url.startswith('https://')):
+                    if request is not None:
+                        l_url = request.build_absolute_uri(l_url)
+                    else:
+                        frontend_url = getattr(settings, 'FRONTEND_URL', 'https://lms.vibesandbox.live').rstrip('/')
+                        l_url = f"{frontend_url}{l_url}"
+                launch_url = l_url
+
             ret['scorm_package'] = {
                 'id': sp.id,
                 'version': sp.version,

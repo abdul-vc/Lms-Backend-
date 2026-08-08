@@ -17,10 +17,11 @@ Including another URLconf
 import os
 import mimetypes
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import path, include, re_path
 from django.http import StreamingHttpResponse, HttpResponse, Http404
 from django.conf import settings
 from django.conf.urls.static import static
+from django.views.static import serve
 
 # Force autodiscover and import all app admin modules
 import users.admin
@@ -148,9 +149,16 @@ def serve_scorm_media(request, path):
 
 def serve_media_video(request, path):
     """
-    Custom video streaming view for videos uploaded to MEDIA_ROOT/course_videos/.
+    Custom video streaming view with range support. Checks course_videos and MEDIA_ROOT.
     """
     file_path = os.path.join(settings.MEDIA_ROOT, 'course_videos', path)
+    if not os.path.exists(file_path):
+        file_path = os.path.join(settings.MEDIA_ROOT, path)
+    if not os.path.exists(file_path):
+        basename = os.path.basename(path)
+        file_path = os.path.join(settings.MEDIA_ROOT, 'course_videos', basename)
+    if not os.path.exists(file_path):
+        file_path = os.path.join(settings.MEDIA_ROOT, basename)
     return stream_video_file(request, file_path)
 
 
@@ -163,11 +171,11 @@ urlpatterns = [
     path('api/', include('authoring_engine.urls')),
     path('api/', include('import_engine.urls')),
     path('api/', include('scorm_export.urls')),
-    # Serve uploaded SCORM packages and videos directly with CORS & frame support
+    # Custom endpoints for streaming video and SCORM packages with CORS
     path('media/scorm/<path:path>', serve_scorm_media, name='serve_scorm_media'),
     path('media/course_videos/<path:path>', serve_media_video, name='serve_media_video'),
+    re_path(r'^media/(?P<path>.*\.mp4)$', serve_media_video),
+    re_path(r'^media/(?P<path>.*\.webm)$', serve_media_video),
+    # Serve all remaining media files (hero images, logos, profile pics) on production
+    re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
 ]
-
-# Serve remaining uploaded media files (hero images, logos) in development
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
