@@ -1,3 +1,4 @@
+from django.conf import settings
 from rest_framework import serializers
 from .models import Course, Module, Lesson, AssessmentQuestion, AccessRequest
 
@@ -28,11 +29,19 @@ class LessonSerializer(serializers.ModelSerializer):
         ret = super().to_representation(instance)
         request = self.context.get('request')
         if ret.get('video_url'):
-            if not (ret['video_url'].startswith('http://') or ret['video_url'].startswith('https://')):
+            url = str(ret['video_url']).strip()
+            for dev_prefix in ['http://127.0.0.1:8000', 'https://127.0.0.1:8000', 'http://localhost:8000', 'https://localhost:8000']:
+                if url.startswith(dev_prefix):
+                    url = url[len(dev_prefix):]
+                    break
+            if not (url.startswith('http://') or url.startswith('https://')):
                 if request is not None:
-                    ret['video_url'] = request.build_absolute_uri(ret['video_url'])
+                    ret['video_url'] = request.build_absolute_uri(url)
                 else:
-                    ret['video_url'] = request.build_absolute_uri(ret['video_url'])
+                    frontend_url = getattr(settings, 'FRONTEND_URL', 'https://lms.vibesandbox.live').rstrip('/')
+                    ret['video_url'] = f"{frontend_url}{url}"
+            else:
+                ret['video_url'] = url
         return ret
 
 class ModuleSerializer(serializers.ModelSerializer):
