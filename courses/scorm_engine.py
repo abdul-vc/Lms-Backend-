@@ -84,11 +84,53 @@ def parse_imsmanifest(manifest_path):
         if launch_href and not default_launch:
             default_launch = launch_href
 
+        type_meta = item.find('.//lessonType')
+        les_type = type_meta.text.strip() if type_meta is not None and type_meta.text else None
+
         sco_items.append({
             'identifier': item_id,
             'title': item_title,
-            'launch_href': launch_href
+            'launch_href': launch_href,
+            'type': les_type
         })
+
+    # 6. Extract Hierarchical Modules & Lessons Tree
+    modules_tree = []
+    for org in root.findall('.//organization'):
+        for mod_item in org.findall('./item'):
+            mod_title_elem = mod_item.find('title')
+            mod_title = mod_title_elem.text.strip() if mod_title_elem is not None and mod_title_elem.text else 'Module'
+            mod_lessons = []
+
+            for les_item in mod_item.findall('./item'):
+                les_title_elem = les_item.find('title')
+                les_title = les_title_elem.text.strip() if les_title_elem is not None and les_title_elem.text else 'Lesson'
+                les_ref = les_item.get('identifierref')
+                les_href = resources.get(les_ref, {}).get('href', '') if les_ref else ''
+                les_type_meta = les_item.find('.//lessonType')
+                l_type = les_type_meta.text.strip() if les_type_meta is not None and les_type_meta.text else None
+
+                mod_lessons.append({
+                    'title': les_title,
+                    'launch_href': les_href,
+                    'type': l_type
+                })
+
+            if not mod_lessons:
+                mod_ref = mod_item.get('identifierref')
+                mod_href = resources.get(mod_ref, {}).get('href', '') if mod_ref else ''
+                mod_type_meta = mod_item.find('.//lessonType')
+                m_type = mod_type_meta.text.strip() if mod_type_meta is not None and mod_type_meta.text else None
+                mod_lessons.append({
+                    'title': mod_title,
+                    'launch_href': mod_href,
+                    'type': m_type
+                })
+
+            modules_tree.append({
+                'title': mod_title,
+                'lessons': mod_lessons
+            })
 
     # If launch file was not explicitly found in items/resources, check common default filenames
     if not default_launch and resources:
@@ -105,6 +147,7 @@ def parse_imsmanifest(manifest_path):
         'mastery_score': mastery_score,
         'launch_file': default_launch,
         'sco_items': sco_items,
+        'modules': modules_tree,
         'raw_manifest_xml': raw_manifest_xml,
     }
 

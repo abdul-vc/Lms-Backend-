@@ -122,34 +122,90 @@ def run_import_pipeline(import_job_id):
                             organization=job.organization,
                             lesson=lesson
                         )
-                        blocks_data = l_data.get('blocks', [])
+                        c_tree = l_data.get('content_tree')
                         root_ids = []
-                        for b_idx, b_data in enumerate(blocks_data):
-                            b_type = b_data.get('type', 'paragraph')
-                            block = LessonBlock.objects.create(
-                                organization=job.organization,
-                                tree=tree,
-                                block_type=b_type,
-                                order=b_idx,
-                                settings={'align': 'left', 'width': 'full'}
-                            )
-                            root_ids.append(str(block.id))
 
-                            payload = b_data.get('payload', {})
-                            if b_type in ['heading', 'paragraph', 'quote', 'code', 'callout', 'table', 'pdf']:
-                                raw_h = payload.get('html', '<p>Content</p>')
-                                clean_h = sanitize_html(raw_h)
-                                ReadingContent.objects.create(
-                                    block=block,
-                                    html_content=clean_h,
-                                    markdown_content=payload.get('markdown', clean_h)
+                        if c_tree and isinstance(c_tree, dict) and 'blocks' in c_tree:
+                            blocks_dict = c_tree.get('blocks', {})
+                            for b_id, b_info in blocks_dict.items():
+                                b_type = b_info.get('type', 'paragraph')
+                                b_order = b_info.get('order', 0)
+                                b_settings = b_info.get('settings', {'align': 'left', 'width': 'full'})
+                                payload = b_info.get('payload', {})
+
+                                block = LessonBlock.objects.create(
+                                    organization=job.organization,
+                                    tree=tree,
+                                    block_type=b_type,
+                                    order=b_order,
+                                    settings=b_settings
                                 )
-                            elif b_type == 'interaction':
-                                InteractionBlock.objects.create(
-                                    block=block,
-                                    interaction_type=payload.get('interaction_type', 'hotspots'),
-                                    config=payload.get('config', {})
+                                root_ids.append(str(block.id))
+
+                                if b_type in ['heading', 'paragraph', 'quote', 'code', 'callout', 'table', 'pdf']:
+                                    raw_h = payload.get('html', '<p>Content</p>')
+                                    clean_h = sanitize_html(raw_h)
+                                    ReadingContent.objects.create(
+                                        block=block,
+                                        html_content=clean_h,
+                                        markdown_content=payload.get('markdown', clean_h)
+                                    )
+                                elif b_type == 'interaction':
+                                    InteractionBlock.objects.create(
+                                        block=block,
+                                        interaction_type=payload.get('interaction_type', 'hotspots'),
+                                        config=payload.get('config', {})
+                                    )
+                                elif b_type == 'quiz' or 'questions' in payload:
+                                    for q in payload.get('questions', []):
+                                        KCQuestion.objects.create(
+                                            organization=job.organization,
+                                            block=block,
+                                            prompt=q.get('prompt', 'Question'),
+                                            question_type=q.get('type', 'single_choice'),
+                                            choices=q.get('choices', []),
+                                            points=q.get('points', 1)
+                                        )
+                                elif b_type == 'scenario' or 'nodes' in payload:
+                                    for n in payload.get('nodes', []):
+                                        ScenarioNode.objects.create(
+                                            block=block,
+                                            title=n.get('title', 'Scenario Node'),
+                                            content=n.get('content', ''),
+                                            is_start_node=n.get('is_start', False),
+                                            is_ending_node=n.get('is_ending', False),
+                                            ending_type=n.get('ending_type', 'neutral'),
+                                            score_delta=n.get('score_delta', 0),
+                                            choices=n.get('choices', [])
+                                        )
+                        else:
+                            blocks_data = l_data.get('blocks', [])
+                            for b_idx, b_data in enumerate(blocks_data):
+                                b_type = b_data.get('type', 'paragraph')
+                                block = LessonBlock.objects.create(
+                                    organization=job.organization,
+                                    tree=tree,
+                                    block_type=b_type,
+                                    order=b_idx,
+                                    settings={'align': 'left', 'width': 'full'}
                                 )
+                                root_ids.append(str(block.id))
+
+                                payload = b_data.get('payload', {})
+                                if b_type in ['heading', 'paragraph', 'quote', 'code', 'callout', 'table', 'pdf']:
+                                    raw_h = payload.get('html', '<p>Content</p>')
+                                    clean_h = sanitize_html(raw_h)
+                                    ReadingContent.objects.create(
+                                        block=block,
+                                        html_content=clean_h,
+                                        markdown_content=payload.get('markdown', clean_h)
+                                    )
+                                elif b_type == 'interaction':
+                                    InteractionBlock.objects.create(
+                                        block=block,
+                                        interaction_type=payload.get('interaction_type', 'hotspots'),
+                                        config=payload.get('config', {})
+                                    )
 
                         tree.root_block_ids = root_ids
                         tree.save(update_fields=['root_block_ids'])

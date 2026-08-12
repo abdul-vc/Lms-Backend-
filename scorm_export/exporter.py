@@ -30,26 +30,32 @@ def generate_scorm_12_manifest(course, manifest_data):
         f'      <title>{title}</title>'
     ]
 
-    item_idx = 1
+    resource_lines = []
+
     for mod in manifest_data.get('modules', []):
-        xml_lines.append(f'      <item identifier="item_mod_{mod["module_id"]}" identifierref="res_{mod["module_id"]}">')
-        xml_lines.append(f'        <title>{mod["title"]}</title>')
+        mod_id = mod.get('module_id')
+        xml_lines.append(f'      <item identifier="item_mod_{mod_id}">')
+        xml_lines.append(f'        <title>{mod.get("title")}</title>')
         for les in mod.get('lessons', []):
-            xml_lines.append(f'        <item identifier="item_les_{les["lesson_id"]}" identifierref="res_{les["lesson_id"]}">')
-            xml_lines.append(f'          <title>{les["title"]}</title>')
+            les_id = les.get('lesson_id')
+            les_type = les.get('type', 'reading')
+            xml_lines.append(f'        <item identifier="item_les_{les_id}" identifierref="res_les_{les_id}">')
+            xml_lines.append(f'          <title>{les.get("title")}</title>')
+            xml_lines.append(f'          <metadata><lessonType>{les_type}</lessonType></metadata>')
             xml_lines.append('        </item>')
-            item_idx += 1
+
+            v_path = les.get('video_rel_path') or 'index.html'
+            resource_lines.append(f'    <resource identifier="res_les_{les_id}" type="webcontent" adlcp:scormtype="sco" href="{v_path}">')
+            resource_lines.append(f'      <file href="{v_path}"/>')
+            resource_lines.append('      <file href="index.html"/>')
+            resource_lines.append('    </resource>')
+
         xml_lines.append('      </item>')
 
     xml_lines.append('    </organization>')
     xml_lines.append('  </organizations>')
     xml_lines.append('  <resources>')
-
-    for mod in manifest_data.get('modules', []):
-        xml_lines.append(f'    <resource identifier="res_{mod["module_id"]}" type="webcontent" adlcp:scormtype="sco" href="index.html">')
-        xml_lines.append('      <file href="index.html"/>')
-        xml_lines.append('    </resource>')
-
+    xml_lines.extend(resource_lines)
     xml_lines.append('  </resources>')
     xml_lines.append('</manifest>')
 
@@ -79,21 +85,33 @@ def generate_scorm_2004_manifest(course, manifest_data):
         f'      <title>{title}</title>'
     ]
 
+    resource_lines = []
+
     for mod in manifest_data.get('modules', []):
-        xml_lines.append(f'      <item identifier="item_mod_{mod["module_id"]}" identifierref="res_{mod["module_id"]}">')
-        xml_lines.append(f'        <title>{mod["title"]}</title>')
+        mod_id = mod.get('module_id')
+        xml_lines.append(f'      <item identifier="item_mod_{mod_id}">')
+        xml_lines.append(f'        <title>{mod.get("title")}</title>')
         xml_lines.append('        <imsss:sequencing><imsss:controlMode choice="true" flow="true"/></imsss:sequencing>')
+        for les in mod.get('lessons', []):
+            les_id = les.get('lesson_id')
+            les_type = les.get('type', 'reading')
+            xml_lines.append(f'        <item identifier="item_les_{les_id}" identifierref="res_les_{les_id}">')
+            xml_lines.append(f'          <title>{les.get("title")}</title>')
+            xml_lines.append(f'          <metadata><lessonType>{les_type}</lessonType></metadata>')
+            xml_lines.append('        </item>')
+
+            v_path = les.get('video_rel_path') or 'index.html'
+            resource_lines.append(f'    <resource identifier="res_les_{les_id}" type="webcontent" adlcp:scormtype="sco" href="{v_path}">')
+            resource_lines.append(f'      <file href="{v_path}"/>')
+            resource_lines.append('      <file href="index.html"/>')
+            resource_lines.append('    </resource>')
+
         xml_lines.append('      </item>')
 
     xml_lines.append('    </organization>')
     xml_lines.append('  </organizations>')
     xml_lines.append('  <resources>')
-
-    for mod in manifest_data.get('modules', []):
-        xml_lines.append(f'    <resource identifier="res_{mod["module_id"]}" type="webcontent" adlcp:scormtype="sco" href="index.html">')
-        xml_lines.append('      <file href="index.html"/>')
-        xml_lines.append('    </resource>')
-
+    xml_lines.extend(resource_lines)
     xml_lines.append('  </resources>')
     xml_lines.append('</manifest>')
 
@@ -176,6 +194,10 @@ def generate_standalone_html(course, manifest_data, scorm_version="1.2"):
         m.lessons.forEach(function(l) {{
           html += '<div style="margin-top: 12px; padding: 12px; background: #0f172a; border-radius: 8px;">';
           html += '<h3>' + l.title + ' (' + l.type + ')</h3>';
+          var vSrc = l.video_rel_path || l.video_url;
+          if (l.type === 'video' && vSrc) {{
+            html += '<video controls width="100%" style="max-height: 400px; border-radius: 8px; margin-top: 10px;" src="' + vSrc + '"></video>';
+          }}
           html += '</div>';
         }});
         html += '</div>';
@@ -208,9 +230,30 @@ def generate_standalone_html(course, manifest_data, scorm_version="1.2"):
 
 def export_course_to_scorm(course, scorm_version="1.2"):
     """
-    Bundles manifest XML, index.html, and media assets into a zip byte stream.
+    Bundles manifest XML, index.html, json manifests, and physical media assets into a zip byte stream.
     """
     manifest_data = compile_course_manifest(course)
+    media_files_to_bundle = {}  # zip_path -> abs_system_path
+
+    for mod in manifest_data.get('modules', []):
+        for les in mod.get('lessons', []):
+            video_url = les.get('video_url')
+            if video_url:
+                clean_url = str(video_url)
+                for prefix in ['http://', 'https://']:
+                    if clean_url.startswith(prefix):
+                        clean_url = '/' + '/'.join(clean_url.split('/')[3:])
+                for prefix in ['/api/media/', '/media/', 'api/media/', 'media/']:
+                    if clean_url.startswith(prefix):
+                        clean_url = clean_url[len(prefix):]
+                        break
+
+                clean_subpath = clean_url.lstrip('/\\')
+                abs_path = os.path.join(settings.MEDIA_ROOT, clean_subpath)
+                if os.path.exists(abs_path) and os.path.isfile(abs_path):
+                    zip_rel_path = f"media/{clean_subpath}"
+                    media_files_to_bundle[zip_rel_path] = abs_path
+                    les['video_rel_path'] = zip_rel_path
 
     if scorm_version == "2004":
         manifest_xml = generate_scorm_2004_manifest(course, manifest_data)
@@ -223,6 +266,12 @@ def export_course_to_scorm(course, scorm_version="1.2"):
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('imsmanifest.xml', manifest_xml)
         zf.writestr('index.html', index_html)
+        manifest_json_bytes = json.dumps(manifest_data, indent=2).encode('utf-8')
+        zf.writestr('lams_manifest.json', manifest_json_bytes)
+        zf.writestr('course_manifest.json', manifest_json_bytes)
+
+        for z_path, s_path in media_files_to_bundle.items():
+            zf.write(s_path, z_path)
 
     zip_buffer.seek(0)
     return zip_buffer
