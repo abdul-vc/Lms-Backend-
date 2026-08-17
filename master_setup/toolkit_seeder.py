@@ -116,7 +116,6 @@ The **Master Setup Console** is the supreme governance layer of the LMS platform
 | `/super-admin/global-settings` | **Platform Configuration** | Global SMTP email server setup, security token expiration TTLs, default branding palettes. |
 | `/super-admin/billing` | **Billing & Subscription Log** | Track tenant billing cycles, invoice histories, plan upgrades, and payment status. |
 | `/super-admin/activity` | **Global Audit Trail** | Log platform-wide administrative actions, security login events, and tenant provisioning logs. |
-| `/super-admin/setup-guide` | **Master Onboarding Wizard** | Step-by-step master setup guide for initializing platform settings and default templates. |
 | `/super-admin/toolkit` | **Master Toolkit** | Central Knowledge Base, System Health Monitor, REST API Explorer, Database Explorer, Change Log, Dependency Map, and Backup Engine. |
 
 ---

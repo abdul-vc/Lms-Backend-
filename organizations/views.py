@@ -660,7 +660,6 @@ class GlobalSearchView(APIView):
                 {'name': 'Global Settings', 'route': '/super-admin/settings', 'keywords': ['global settings', 'settings', 'configuration', 'config']},
                 {'name': 'Billing & Payments', 'route': '/super-admin/billing', 'keywords': ['billing', 'payments', 'payment', 'invoices', 'invoice']},
                 {'name': 'Activity Log', 'route': '/super-admin/activity', 'keywords': ['activity log', 'activity', 'audit', 'logs', 'log']},
-                {'name': 'Setup Guide', 'route': '/super-admin/setup', 'keywords': ['setup guide', 'setup', 'guide', 'onboarding']},
                 {'name': 'Master Toolkit', 'route': '/super-admin/toolkit', 'keywords': ['master toolkit', 'toolkit', 'tools', 'utility', 'utilities']},
                 {'name': 'My Profile', 'route': '/super-admin/profile', 'keywords': ['my profile', 'profile', 'personal information', 'account', 'password', 'p']},
             ]
