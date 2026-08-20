@@ -105,10 +105,11 @@ class Lesson(models.Model):
 
 class AssessmentQuestion(models.Model):
     """
-    An assessment question for a course, imported via CSV.
+    An assessment question for a course or a specific lesson, imported via CSV.
     Uses a standard 4-option multiple choice format.
     """
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='assessment_questions')
+    lesson = models.ForeignKey('courses.Lesson', on_delete=models.CASCADE, related_name='assessment_questions', null=True, blank=True)
     question_text = models.TextField()
     option_a = models.CharField(max_length=500)
     option_b = models.CharField(max_length=500)
@@ -116,6 +117,7 @@ class AssessmentQuestion(models.Model):
     option_d = models.CharField(max_length=500)
     # The correct option key, e.g., 'A', 'B', 'C', or 'D'
     correct_option = models.CharField(max_length=1)
+    explanation = models.TextField(blank=True, default='')
 
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -123,7 +125,8 @@ class AssessmentQuestion(models.Model):
         ordering = ['id']
 
     def __str__(self):
-        return f"{self.course.title} - Q: {self.question_text[:30]}..."
+        prefix = f"Lesson {self.lesson_id}" if self.lesson_id else self.course.title
+        return f"{prefix} - Q: {self.question_text[:30]}..."
 
 class AccessRequest(models.Model):
     STATUS_CHOICES = [('pending', 'Pending'), ('accepted', 'Accepted'), ('rejected', 'Rejected')]
@@ -139,6 +142,7 @@ class AccessRequest(models.Model):
 
 class AssessmentAttempt(models.Model):
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='attempts')
+    lesson = models.ForeignKey('courses.Lesson', on_delete=models.CASCADE, related_name='assessment_attempts', null=True, blank=True)
     user = models.ForeignKey('users.User', on_delete=models.CASCADE, related_name='assessment_attempts')
     started_at = models.DateTimeField(auto_now_add=True)
     submitted_at = models.DateTimeField(null=True, blank=True)
@@ -146,6 +150,7 @@ class AssessmentAttempt(models.Model):
     score_percent = models.IntegerField(null=True, blank=True)
     passed = models.BooleanField(null=True, blank=True)
     answers = models.JSONField(default=dict, blank=True)  # {question_id: "A", ...}
+    question_ids = models.JSONField(default=list, blank=True)  # [q_id1, q_id2, ...] in randomized order
 
     class Meta:
         ordering = ['-started_at']

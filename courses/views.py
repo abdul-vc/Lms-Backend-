@@ -13,7 +13,7 @@ from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework.decorators import action
 
-from .models import Course, Module, Lesson, AccessRequest, AssessmentQuestion
+from .models import Course, Module, Lesson, AccessRequest, AssessmentQuestion, AssessmentAttempt
 from .serializers import CourseSerializer, ModuleSerializer, LessonSerializer, AccessRequestSerializer, AssessmentQuestionSerializer
 from organizations.permissions import IsOrgScoped
 from organizations.audit import log_activity
@@ -160,9 +160,17 @@ class LessonViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         module_pk = self.kwargs.get('module_pk')
         if module_pk:
-            serializer.save(module_id=module_pk)
+            lesson = serializer.save(module_id=module_pk)
         else:
-            serializer.save()
+            lesson = serializer.save()
+        
+        org = lesson.module.course.organization if (lesson.module and lesson.module.course) else None
+        if org:
+            from authoring_engine.models import LessonBlockTree
+            LessonBlockTree.objects.get_or_create(
+                lesson=lesson,
+                defaults={'organization': org}
+            )
 
     def perform_update(self, serializer):
         old_video = getattr(self.get_object(), 'video_url', None) if self.get_object() else None
@@ -307,12 +315,28 @@ class AssessmentQuestionViewSet(viewsets.ModelViewSet):
         serializer.save(course=course)
 
 
+def _is_assessment_eligible(user, course):
+    """Check if user has completed all course lessons and is eligible for assessment."""
+    if user.is_platform_super_admin:
+        return True
+    total_lessons = Lesson.objects.filter(module__course=course).count()
+    if total_lessons == 0:
+        return True
+    from .models import LessonProgress
+    completed_lessons = LessonProgress.objects.filter(
+        user=user,
+        lesson__module__course=course,
+        completed=True
+    ).count()
+    return completed_lessons >= total_lessons
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def download_assessment_template(request, course_pk=None):
     """
     GET /api/courses/{course_pk}/assessment/template/
-    Returns a downloadable sample CSV template for assessment questions.
+    Returns a downloadable sample CSV template for assessment questions with Explanation column.
     """
     import csv
     from django.http import HttpResponse
@@ -321,14 +345,15 @@ def download_assessment_template(request, course_pk=None):
     response['Content-Disposition'] = 'attachment; filename="assessment_questions_template.csv"'
 
     writer = csv.writer(response)
-    writer.writerow(['Question Text', 'Option A', 'Option B', 'Option C', 'Option D', 'Correct Option (A/B/C/D)'])
+    writer.writerow(['Question Text', 'Option A', 'Option B', 'Option C', 'Option D', 'Correct Option (A/B/C/D)', 'Explanation'])
     writer.writerow([
         'What is the primary goal of this course?',
         'Understanding foundational concepts and best practices',
         'Bypassing system security protocols',
         'Skipping verification steps',
         'Disabling audit logs',
-        'A'
+        'A',
+        'This course establishes core compliance, foundational standards, and safe operational guidelines.'
     ])
     writer.writerow([
         'How can compliance and quality be effectively maintained?',
@@ -336,7 +361,8 @@ def download_assessment_template(request, course_pk=None):
         'By ignoring runtime errors',
         'By executing unverified code changes',
         'By removing safety controls',
-        'A'
+        'A',
+        'Standard operating procedures require continuous monitoring and strict adherence to validated workflows.'
     ])
 
     return response
@@ -349,6 +375,7 @@ def import_assessment_csv(request, course_pk):
     """
     POST /api/courses/{course_pk}/assessment/import/
     Parses an uploaded CSV file and creates AssessmentQuestion objects.
+    Supports both 6-column (legacy) and 7-column (with Explanation) CSV formats.
     """
     from .models import AssessmentQuestion, Course
     from .serializers import AssessmentQuestionSerializer
@@ -389,7 +416,7 @@ def import_assessment_csv(request, course_pk):
             if not row or not any(row):
                 continue
                 
-            row = row + [''] * max(0, 6 - len(row))
+            row = row + [''] * max(0, 7 - len(row))
 
             q_text = row[0].strip()
             opt_a = row[1].strip()
@@ -397,6 +424,7 @@ def import_assessment_csv(request, course_pk):
             opt_c = row[3].strip()
             opt_d = row[4].strip()
             correct = row[5].strip().upper()
+            explanation = row[6].strip() if len(row) > 6 else ''
 
             if not q_text or correct not in ['A', 'B', 'C', 'D']:
                 continue
@@ -408,13 +436,14 @@ def import_assessment_csv(request, course_pk):
                 option_b=opt_b,
                 option_c=opt_c,
                 option_d=opt_d,
-                correct_option=correct
+                correct_option=correct,
+                explanation=explanation
             ))
 
         if not questions_to_create:
-            return Response({'error': 'No valid questions found in CSV file. Please ensure columns match: Question Text, Option A, Option B, Option C, Option D, Correct Option (A/B/C/D).'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'No valid questions found in CSV file. Please ensure columns match: Question Text, Option A, Option B, Option C, Option D, Correct Option (A/B/C/D), [Explanation].'}, status=status.HTTP_400_BAD_REQUEST)
 
-        AssessmentQuestion.objects.filter(course=course).delete()
+        AssessmentQuestion.objects.filter(course=course, lesson__isnull=True).delete()
         created = AssessmentQuestion.objects.bulk_create(questions_to_create)
 
         log_activity(request, 'assessment_imported', target=course, organization=course.organization, metadata={'count': len(created)})
@@ -427,6 +456,40 @@ def import_assessment_csv(request, course_pk):
         }, status=status.HTTP_201_CREATED)
     except Exception as e:
         return Response({'error': f'Failed to parse CSV: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_course_assessment(request, course_pk):
+    """
+    POST /api/courses/{course_pk}/assessment/delete/
+    Deletes all course-level assessment questions and unsubmitted attempts for the specified course.
+    Keeps lesson-specific assessment questions intact.
+    Enforces tenant isolation.
+    """
+    try:
+        course = Course.objects.filter(pk=course_pk).first()
+        if not course:
+            return Response({'error': 'Course not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not request.user.is_platform_super_admin:
+            if not request.user.organization_id or course.organization_id != request.user.organization_id:
+                return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        deleted_count, _ = AssessmentQuestion.objects.filter(course=course, lesson__isnull=True).delete()
+        AssessmentAttempt.objects.filter(course=course, lesson__isnull=True, submitted_at__isnull=True).delete()
+
+        try:
+            log_activity(request, 'assessment_deleted', target=course, organization=course.organization, metadata={'deleted_count': deleted_count, 'course_id': course_pk})
+        except Exception:
+            pass
+
+        return Response({
+            'message': 'Course assessment question bank removed successfully.',
+            'deleted_count': deleted_count
+        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        return Response({'error': f'Failed to delete assessment: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class AccessRequestViewSet(viewsets.ModelViewSet):
@@ -477,16 +540,41 @@ def request_access(request, course_pk):
 def get_assessment_questions(request, course_pk):
     """
     GET /api/courses/{course_pk}/assessment/questions/
-    Returns up to 50 questions for the course.
+    If the learner has an active (unsubmitted) attempt, returns the exact randomized
+    question subset and order stored in that attempt so reloading does not reshuffle.
+    For org/super admins, returns all questions for preview/authoring.
     """
-    from .models import AssessmentQuestion
+    from .models import AssessmentQuestion, AssessmentAttempt
     from .serializers import AssessmentQuestionSerializer
 
-    filter_kwargs = {'course_id': course_pk}
-    if not request.user.is_platform_super_admin and request.user.organization_id:
-        filter_kwargs['course__organization_id'] = request.user.organization_id
+    # Check if user is an admin or author viewing for editing
+    is_admin = request.user.is_platform_super_admin or (
+        request.user.role and (request.user.role.is_admin_role or request.user.role.can_edit_courses)
+    )
 
-    questions = AssessmentQuestion.objects.filter(**filter_kwargs).order_by('id')[:50]
+    if is_admin:
+        filter_kwargs = {'course_id': course_pk, 'lesson__isnull': True}
+        if not request.user.is_platform_super_admin and request.user.organization_id:
+            filter_kwargs['course__organization_id'] = request.user.organization_id
+        questions = AssessmentQuestion.objects.filter(**filter_kwargs).order_by('id')
+        serializer = AssessmentQuestionSerializer(questions, many=True)
+        return Response(serializer.data)
+
+    # For learner: check for an active unsubmitted attempt
+    active_attempt = AssessmentAttempt.objects.filter(
+        course_id=course_pk,
+        user=request.user,
+        submitted_at__isnull=True
+    ).order_by('-started_at').first()
+
+    if active_attempt and active_attempt.question_ids:
+        q_map = {q.id: q for q in AssessmentQuestion.objects.filter(id__in=active_attempt.question_ids)}
+        ordered_questions = [q_map[qid] for qid in active_attempt.question_ids if qid in q_map]
+        serializer = AssessmentQuestionSerializer(ordered_questions, many=True)
+        return Response(serializer.data)
+
+    # Fallback if no active attempt exists yet
+    questions = AssessmentQuestion.objects.filter(course_id=course_pk, lesson__isnull=True).order_by('id')[:10]
     serializer = AssessmentQuestionSerializer(questions, many=True)
     return Response(serializer.data)
 
@@ -494,25 +582,81 @@ def get_assessment_questions(request, course_pk):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def start_assessment(request, course_pk):
-    from .models import AssessmentAttempt
-    from .serializers import AssessmentAttemptSerializer
+    """
+    POST /api/courses/{course_pk}/assessment/start/
+    Starts a new assessment attempt or resumes an existing active (unsubmitted) attempt.
+    - Enforces lock eligibility: All course lessons must be completed before starting.
+    - Generates a fresh random subset of up to 10 questions in a randomized order per new attempt.
+    - Preserves the randomized order on existing active attempt so page refresh does not reshuffle.
+    """
+    import random
+    from .models import AssessmentAttempt, AssessmentQuestion
+    from .serializers import AssessmentAttemptSerializer, AssessmentQuestionSerializer
+
     course = Course.objects.filter(pk=course_pk).first()
     if not course:
         return Response({'error': 'Course not found.'}, status=status.HTTP_404_NOT_FOUND)
-        
+
+    # Validate lesson completion eligibility
+    if not _is_assessment_eligible(request.user, course):
+        return Response({
+            'error': 'Assessment is locked. You must complete all course lessons first before attempting the assessment.',
+            'is_locked': True
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    # Check for an existing unsubmitted attempt for this user & course
+    active_attempt = AssessmentAttempt.objects.filter(
+        course=course,
+        user=request.user,
+        submitted_at__isnull=True
+    ).order_by('-started_at').first()
+
+    if active_attempt and active_attempt.question_ids:
+        # Resume existing active attempt without reshuffling
+        q_map = {q.id: q for q in AssessmentQuestion.objects.filter(id__in=active_attempt.question_ids)}
+        ordered_questions = [q_map[qid] for qid in active_attempt.question_ids if qid in q_map]
+        serializer = AssessmentAttemptSerializer(active_attempt)
+        return Response({
+            **serializer.data,
+            'questions': AssessmentQuestionSerializer(ordered_questions, many=True).data
+        }, status=status.HTTP_200_OK)
+
+    # New Attempt: Select a fresh random subset of up to 10 questions in randomized order
+    all_q_ids = list(AssessmentQuestion.objects.filter(course=course, lesson__isnull=True).values_list('id', flat=True))
+    if not all_q_ids:
+        return Response({'error': 'No assessment questions configured for this course.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    sample_size = min(10, len(all_q_ids))
+    selected_ids = random.sample(all_q_ids, sample_size)
+
     attempt = AssessmentAttempt.objects.create(
         course=course,
-        user=request.user
+        user=request.user,
+        question_ids=selected_ids
     )
+
+    q_map = {q.id: q for q in AssessmentQuestion.objects.filter(id__in=selected_ids)}
+    ordered_questions = [q_map[qid] for qid in selected_ids if qid in q_map]
+
     serializer = AssessmentAttemptSerializer(attempt)
-    return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response({
+        **serializer.data,
+        'questions': AssessmentQuestionSerializer(ordered_questions, many=True).data
+    }, status=status.HTTP_201_CREATED)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def submit_assessment(request, course_pk, attempt_id):
+    """
+    POST /api/courses/{course_pk}/assessment/{attempt_id}/submit/
+    Submits and grades an assessment attempt.
+    - Evaluates only the specific questions assigned to this attempt.
+    - If the user FAILS: automatically resets all lesson progress for this course,
+      re-locking the assessment until the user completes the lessons again.
+    """
     from django.utils import timezone
-    from .models import AssessmentAttempt, AssessmentQuestion
+    from .models import AssessmentAttempt, AssessmentQuestion, LessonProgress
     
     try:
         attempt = AssessmentAttempt.objects.get(pk=attempt_id, course_id=course_pk, user=request.user)
@@ -530,8 +674,13 @@ def submit_assessment(request, course_pk, attempt_id):
     answers = request.data.get('answers', {})
     auto_submitted = request.data.get('auto_submitted', False)
     
-    questions = AssessmentQuestion.objects.filter(course_id=course_pk)
-    total_questions = questions.count()
+    # Evaluate only the questions assigned to this attempt
+    if attempt.question_ids:
+        questions = AssessmentQuestion.objects.filter(id__in=attempt.question_ids)
+        total_questions = len(attempt.question_ids)
+    else:
+        questions = AssessmentQuestion.objects.filter(course_id=course_pk)
+        total_questions = questions.count()
 
     if total_questions == 0:
         return Response({
@@ -565,13 +714,19 @@ def submit_assessment(request, course_pk, attempt_id):
     
     log_activity(request, 'assessment_attempted', target=attempt.course, organization=attempt.course.organization if attempt.course else None, metadata={'score_percent': score_percent, 'passed': attempt.passed})
     
+    # ON FAILURE: Re-lock assessment by resetting lesson progress for this course
+    if not attempt.passed and attempt.course:
+        LessonProgress.objects.filter(
+            user=request.user,
+            lesson__module__course=attempt.course
+        ).update(completed=False, completed_at=None, last_position_seconds=0)
+
+    # ON PASS: Issue certificate if passing
     if attempt.passed and attempt.course:
         from .models import IssuedCertificate
         from organizations.models import CertificateTemplate
 
         org = attempt.course.organization or (request.user.organization if request.user else None)
-        # Prefer the template explicitly assigned to this course by the org admin.
-        # Fall back to any org-level template if none is assigned.
         active_tpl = attempt.course.certificate_template
         if active_tpl is None and org:
             active_tpl = CertificateTemplate.objects.filter(organization=org).first()
@@ -597,6 +752,385 @@ def submit_assessment(request, course_pk, attempt_id):
         'correct_count': correct_count,
         'total_questions': total_questions
     })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def restart_course_progress(request, course_pk):
+    """
+    POST /api/courses/{course_pk}/restart/
+    Resets all lesson progress and unsubmitted assessment attempts for this course,
+    immediately re-locking the assessment until the user completes the lessons again.
+    """
+    from .models import LessonProgress, AssessmentAttempt, Course
+    course = Course.objects.filter(pk=course_pk).first()
+    if not course:
+        return Response({'error': 'Course not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    LessonProgress.objects.filter(
+        user=request.user,
+        lesson__module__course=course
+    ).update(completed=False, completed_at=None, last_position_seconds=0)
+
+    AssessmentAttempt.objects.filter(
+        course=course,
+        user=request.user,
+        submitted_at__isnull=True
+    ).delete()
+
+    return Response({
+        'status': 'success',
+        'message': 'Course progress reset and assessment locked. Complete lessons to unlock.'
+    })
+
+
+# ── Lesson-Specific Assessment Endpoints ─────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def download_lesson_assessment_template(request, lesson_pk):
+    """
+    GET /api/lessons/{lesson_pk}/assessment/template/
+    Returns a downloadable sample CSV template for lesson assessment questions.
+    """
+    import csv
+    from django.http import HttpResponse
+
+    response = HttpResponse(content_type='text/csv; charset=utf-8')
+    response['Content-Disposition'] = f'attachment; filename="lesson_{lesson_pk}_assessment_template.csv"'
+
+    writer = csv.writer(response)
+    writer.writerow(['Question Text', 'Option A', 'Option B', 'Option C', 'Option D', 'Correct Option (A/B/C/D)', 'Explanation'])
+    writer.writerow([
+        'What is the core principle taught in this lesson?',
+        'Understanding standard operating procedures and best practices',
+        'Skipping safety verification steps',
+        'Bypassing system audit checks',
+        'Disabling exception monitoring',
+        'A',
+        'Adherence to standard operating procedures ensures consistent compliance and operational quality.'
+    ])
+    writer.writerow([
+        'How should anomalous conditions in this lesson workflow be addressed?',
+        'By immediately reporting and documenting the event per protocols',
+        'By continuing without logging the anomaly',
+        'By overriding automated safety alerts',
+        'By deleting error logs',
+        'A',
+        'Protocol compliance mandates immediate reporting and structured documentation of all workflow deviations.'
+    ])
+
+    return response
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsOrgScoped])
+@parser_classes([MultiPartParser, FormParser])
+def import_lesson_assessment_csv(request, lesson_pk):
+    """
+    POST /api/lessons/{lesson_pk}/assessment/import/
+    Parses an uploaded CSV file and creates AssessmentQuestion objects linked specifically to this lesson.
+    """
+    from .models import AssessmentQuestion, Lesson
+    from .serializers import AssessmentQuestionSerializer
+
+    file = request.FILES.get('file')
+    if not file:
+        return Response({'error': 'No file provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        lesson = Lesson.objects.select_related('module__course').get(pk=lesson_pk)
+    except Lesson.DoesNotExist:
+        return Response({'error': 'Lesson not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    course = lesson.module.course
+    if not request.user.is_platform_super_admin:
+        if course.organization_id != request.user.organization_id:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    try:
+        raw_bytes = file.read()
+        try:
+            decoded_file = raw_bytes.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            decoded_file = raw_bytes.decode('latin-1')
+
+        io_string = io.StringIO(decoded_file, newline='')
+        
+        dialect = csv.excel
+        try:
+            dialect = csv.Sniffer().sniff(decoded_file[:1024])
+        except Exception:
+            pass
+            
+        reader = csv.reader(io_string, dialect)
+        header = next(reader, None)
+
+        questions_to_create = []
+        for row in reader:
+            if not row or not any(row):
+                continue
+                
+            row = row + [''] * max(0, 7 - len(row))
+
+            q_text = row[0].strip()
+            opt_a = row[1].strip()
+            opt_b = row[2].strip()
+            opt_c = row[3].strip()
+            opt_d = row[4].strip()
+            correct = row[5].strip().upper()
+            explanation = row[6].strip() if len(row) > 6 else ''
+
+            if not q_text or correct not in ['A', 'B', 'C', 'D']:
+                continue
+
+            questions_to_create.append(AssessmentQuestion(
+                course=course,
+                lesson=lesson,
+                question_text=q_text,
+                option_a=opt_a,
+                option_b=opt_b,
+                option_c=opt_c,
+                option_d=opt_d,
+                correct_option=correct,
+                explanation=explanation
+            ))
+
+        if not questions_to_create:
+            return Response({'error': 'No valid questions found in CSV file. Columns: Question Text, Option A, Option B, Option C, Option D, Correct Option (A/B/C/D), [Explanation].'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Delete only questions belonging to THIS specific lesson
+        AssessmentQuestion.objects.filter(lesson=lesson).delete()
+        created = AssessmentQuestion.objects.bulk_create(questions_to_create)
+
+        log_activity(request, 'assessment_imported', target=lesson, organization=course.organization, metadata={'count': len(created), 'lesson_id': lesson.id})
+
+        serializer = AssessmentQuestionSerializer(created, many=True)
+        return Response({
+            'message': f'Successfully imported {len(created)} assessment questions for Lesson "{lesson.title}".',
+            'count': len(created),
+            'questions': serializer.data
+        }, status=status.HTTP_201_CREATED)
+    except Exception as e:
+        return Response({'error': f'Failed to parse CSV: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_lesson_assessment_questions(request, lesson_pk):
+    """
+    GET /api/lessons/{lesson_pk}/assessment/questions/
+    Returns questions for this specific lesson.
+    If learner is taking an active attempt, returns the preserved randomized subset and order.
+    """
+    from .models import AssessmentQuestion, AssessmentAttempt
+    from .serializers import AssessmentQuestionSerializer
+
+    is_admin = request.user.is_platform_super_admin or (
+        request.user.role and (request.user.role.is_admin_role or request.user.role.can_edit_courses)
+    )
+
+    if is_admin:
+        questions = AssessmentQuestion.objects.filter(lesson_id=lesson_pk).order_by('id')
+        serializer = AssessmentQuestionSerializer(questions, many=True)
+        return Response(serializer.data)
+
+    # For learner: check for an active unsubmitted attempt for this lesson
+    active_attempt = AssessmentAttempt.objects.filter(
+        lesson_id=lesson_pk,
+        user=request.user,
+        submitted_at__isnull=True
+    ).order_by('-started_at').first()
+
+    if active_attempt and active_attempt.question_ids:
+        q_map = {q.id: q for q in AssessmentQuestion.objects.filter(id__in=active_attempt.question_ids)}
+        ordered_questions = [q_map[qid] for qid in active_attempt.question_ids if qid in q_map]
+        serializer = AssessmentQuestionSerializer(ordered_questions, many=True)
+        return Response(serializer.data)
+
+    questions = AssessmentQuestion.objects.filter(lesson_id=lesson_pk).order_by('id')[:10]
+    serializer = AssessmentQuestionSerializer(questions, many=True)
+    return Response(serializer.data)
+
+
+def _is_lesson_assessment_eligible(user, lesson):
+    """
+    Check if user has completed the lesson video/content and is eligible for the lesson assessment.
+    Platform super admins and organization admins/course authors can view without restriction.
+    """
+    if user.is_platform_super_admin:
+        return True
+    if user.role and (user.role.is_admin_role or user.role.can_edit_courses):
+        return True
+    from .models import LessonProgress
+    progress = LessonProgress.objects.filter(user=user, lesson=lesson, completed=True).first()
+    return bool(progress)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def start_lesson_assessment(request, lesson_pk):
+    """
+    POST /api/lessons/{lesson_pk}/assessment/start/
+    Starts a new assessment attempt specifically for this lesson.
+    - Enforces lock eligibility: The lesson video must be completed first.
+    - Resets lesson completion progress so that leaving/exiting mid-assessment requires completing the video again.
+    - Generates a fresh random subset of up to 10 questions in a randomized order.
+    """
+    import random
+    from .models import AssessmentAttempt, AssessmentQuestion, Lesson, LessonProgress
+    from .serializers import AssessmentAttemptSerializer, AssessmentQuestionSerializer
+
+    lesson = Lesson.objects.select_related('module__course').filter(pk=lesson_pk).first()
+    if not lesson:
+        return Response({'error': 'Lesson not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    # 1. Enforce video completion eligibility
+    if not _is_lesson_assessment_eligible(request.user, lesson):
+        return Response({
+            'error': 'Lesson assessment is locked. You must complete the full lesson video first before attempting the assessment.',
+            'is_locked': True
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    # Clean up any unsubmitted previous attempt
+    AssessmentAttempt.objects.filter(
+        lesson=lesson,
+        user=request.user,
+        submitted_at__isnull=True
+    ).delete()
+
+    # New Attempt: Select a fresh random subset of up to 10 questions for THIS lesson
+    all_q_ids = list(AssessmentQuestion.objects.filter(lesson=lesson).values_list('id', flat=True))
+    if not all_q_ids:
+        return Response({'error': 'No assessment questions configured for this lesson.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    sample_size = min(10, len(all_q_ids))
+    selected_ids = random.sample(all_q_ids, sample_size)
+
+    attempt = AssessmentAttempt.objects.create(
+        course=lesson.module.course,
+        lesson=lesson,
+        user=request.user,
+        question_ids=selected_ids
+    )
+
+    # 2. IF USER LEAVES/EXITS: Consume video completion immediately so leaving mid-assessment re-locks
+    is_admin = request.user.is_platform_super_admin or (request.user.role and (request.user.role.is_admin_role or request.user.role.can_edit_courses))
+    if not is_admin:
+        LessonProgress.objects.filter(
+            user=request.user,
+            lesson=lesson
+        ).update(completed=False, completed_at=None, last_position_seconds=0)
+
+    q_map = {q.id: q for q in AssessmentQuestion.objects.filter(id__in=selected_ids)}
+    ordered_questions = [q_map[qid] for qid in selected_ids if qid in q_map]
+
+    serializer = AssessmentAttemptSerializer(attempt)
+    return Response({
+        **serializer.data,
+        'questions': AssessmentQuestionSerializer(ordered_questions, many=True).data
+    }, status=status.HTTP_201_CREATED)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def submit_lesson_assessment(request, lesson_pk, attempt_id):
+    """
+    POST /api/lessons/{lesson_pk}/assessment/{attempt_id}/submit/
+    Submits and grades a lesson-specific assessment attempt.
+    - Evaluates only the questions in this attempt.
+    - If PASSED: marks this lesson as completed in LessonProgress.
+    - If FAILED: resets ONLY this lesson's progress to incomplete, re-locking this lesson's assessment!
+    """
+    from django.utils import timezone
+    from .models import AssessmentAttempt, AssessmentQuestion, LessonProgress, Lesson
+    
+    try:
+        attempt = AssessmentAttempt.objects.select_related('lesson', 'course').get(pk=attempt_id, lesson_id=lesson_pk, user=request.user)
+    except AssessmentAttempt.DoesNotExist:
+        attempt = AssessmentAttempt.objects.filter(lesson_id=lesson_pk, user=request.user, submitted_at__isnull=True).order_by('-started_at').first()
+        if not attempt:
+            lesson = Lesson.objects.select_related('module__course').filter(pk=lesson_pk).first()
+            if not lesson:
+                return Response({'error': 'Lesson not found.'}, status=status.HTTP_404_NOT_FOUND)
+            attempt = AssessmentAttempt.objects.create(course=lesson.module.course, lesson=lesson, user=request.user)
+        
+    if attempt.submitted_at:
+        return Response({'error': 'Attempt already submitted.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    answers = request.data.get('answers', {})
+    auto_submitted = request.data.get('auto_submitted', False)
+    
+    if attempt.question_ids:
+        questions = AssessmentQuestion.objects.filter(id__in=attempt.question_ids)
+        total_questions = len(attempt.question_ids)
+    else:
+        questions = AssessmentQuestion.objects.filter(lesson_id=lesson_pk)
+        total_questions = questions.count()
+
+    if total_questions == 0:
+        return Response({
+            'error': 'No assessment questions exist for this lesson.',
+            'score_percent': 0,
+            'passed': False
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    correct_count = 0
+    opt_map = {'0': 'A', '1': 'B', '2': 'C', '3': 'D', 'A': 'A', 'B': 'B', 'C': 'C', 'D': 'D'}
+
+    for q in questions:
+        q_id = str(q.id)
+        if q_id in answers:
+            user_ans = str(answers[q_id]).strip().upper()
+            user_letter = opt_map.get(user_ans, user_ans)
+            correct_letter = str(q.correct_option).strip().upper()
+            if user_letter == correct_letter:
+                correct_count += 1
+            
+    score_percent = int((correct_count / total_questions) * 100)
+    passing_score = attempt.course.passing_score if (attempt.course and attempt.course.passing_score) else 70
+    passed = score_percent >= passing_score
+
+    attempt.submitted_at = timezone.now()
+    attempt.auto_submitted = auto_submitted
+    attempt.answers = answers
+    attempt.score_percent = score_percent
+    attempt.passed = passed
+    attempt.save()
+    
+    log_activity(request, 'assessment_attempted', target=attempt.lesson or attempt.course, organization=attempt.course.organization if attempt.course else None, metadata={'score_percent': score_percent, 'passed': attempt.passed, 'lesson_id': lesson_pk})
+    
+    # LESSON-SPECIFIC LOCK & PROGRESS HANDLING
+    if attempt.lesson:
+        if attempt.passed:
+            # Mark ONLY this lesson completed
+            progress_obj, _ = LessonProgress.objects.get_or_create(user=request.user, lesson=attempt.lesson)
+            progress_obj.completed = True
+            progress_obj.completed_at = timezone.now()
+            progress_obj.save()
+            
+            # Check if all lessons are now complete
+            total_lessons = Lesson.objects.filter(module__course=attempt.course).count()
+            completed_lessons = LessonProgress.objects.filter(user=request.user, lesson__module__course=attempt.course, completed=True).count()
+            if total_lessons > 0 and total_lessons == completed_lessons:
+                log_activity(request, 'course_completed', target=attempt.course, organization=attempt.course.organization)
+        else:
+            # ON FAILURE: Reset ONLY this lesson's progress to re-lock it
+            LessonProgress.objects.filter(
+                user=request.user,
+                lesson=attempt.lesson
+            ).update(completed=False, completed_at=None, last_position_seconds=0)
+
+    return Response({
+        'id': attempt.id,
+        'score_percent': attempt.score_percent,
+        'passed': attempt.passed,
+        'auto_submitted': attempt.auto_submitted,
+        'correct_count': correct_count,
+        'total_questions': total_questions
+    })
+
+
 
 class MyCertificatesView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
@@ -974,7 +1508,7 @@ def learner_dashboard_data(request):
             'category': course.category or 'General',
             'level': course.level,
             'duration_hrs': course.duration_hrs,
-            'hero_url': request.build_absolute_uri(course.hero_url) if course.hero_url and not (course.hero_url.startswith('http://') or course.hero_url.startswith('https://')) else (course.hero_url or "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=800&auto=format&fit=crop&q=80"),
+            'hero_url': request.build_absolute_uri(course.hero_url) if course.hero_url and not (course.hero_url.startswith('http://') or course.hero_url.startswith('https://')) else (course.hero_url or ""),
             'accent': course.accent,
             'progress_pct': progress_pct,
             'status': status_label,

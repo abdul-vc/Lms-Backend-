@@ -19,6 +19,7 @@ BLOCK_TYPE_CHOICES = [
     ('interaction', 'Interaction'),
     ('quiz', 'Quiz'),
     ('scenario', 'Scenario'),
+    ('assessment', 'Assessment'),
 ]
 
 INTERACTION_TYPE_CHOICES = [

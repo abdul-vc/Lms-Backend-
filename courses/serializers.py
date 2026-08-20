@@ -5,6 +5,7 @@ from .models import Course, Module, Lesson, AssessmentQuestion, AccessRequest
 
 class LessonSerializer(serializers.ModelSerializer):
     block_tree = serializers.SerializerMethodField()
+    title = serializers.CharField(max_length=255, required=False, allow_blank=True, default='Untitled Lesson')
 
     class Meta:
         model = Lesson
@@ -12,8 +13,6 @@ class LessonSerializer(serializers.ModelSerializer):
         read_only_fields = ['module']
 
     def get_block_tree(self, instance):
-        if instance.type == 'video':
-            return None
         from authoring_engine.models import LessonBlockTree
         from authoring_engine.serializers import LessonBlockTreeSerializer
         org = instance.module.course.organization if (instance.module and instance.module.course) else None
@@ -77,11 +76,21 @@ class CourseSerializer(serializers.ModelSerializer):
     modules = ModuleSerializer(many=True, read_only=True)
     user_progress = serializers.SerializerMethodField()
     accent = serializers.CharField(required=False, allow_blank=True, default='var(--brand)')
+    has_assessment = serializers.SerializerMethodField()
+    assessment_question_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Course
         fields = '__all__'
         read_only_fields = ['organization']
+
+    def get_has_assessment(self, obj):
+        from .models import AssessmentQuestion
+        return AssessmentQuestion.objects.filter(course=obj, lesson__isnull=True).exists()
+
+    def get_assessment_question_count(self, obj):
+        from .models import AssessmentQuestion
+        return AssessmentQuestion.objects.filter(course=obj, lesson__isnull=True).count()
 
     def get_user_progress(self, obj):
         request = self.context.get('request')
