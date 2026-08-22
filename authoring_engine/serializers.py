@@ -44,10 +44,25 @@ class LessonBlockTreeSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class AuthoringAssetSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+    path = serializers.SerializerMethodField()
+
     class Meta:
         model = AuthoringAsset
         fields = '__all__'
         read_only_fields = ['organization', 'file_hash', 'original_filename', 'mime_type', 'file_size']
+
+    def get_path(self, obj):
+        return str(obj.file.name) if obj.file else ''
+
+    def get_url(self, obj):
+        if not obj.file:
+            return ''
+        relative_url = f"/api/media/{obj.file.name}"
+        request = self.context.get('request')
+        if request:
+            return request.build_absolute_uri(relative_url)
+        return relative_url
 
 class CourseVersionSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)

@@ -219,16 +219,22 @@ def evaluate_kc_question(request, question_id):
     attempt_num = int(request.data.get('attempt_number', 1))
 
     is_correct = False
+    correct_answers_display = []
+
     if q.question_type in ['single_choice', 'true_false']:
         correct_ids = [c['id'] for c in q.choices if c.get('is_correct')]
+        correct_answers_display = [c.get('text', '') for c in q.choices if c.get('is_correct')]
         is_correct = len(selected) == 1 and selected[0] in correct_ids
     elif q.question_type == 'multiple_select':
         correct_ids = set(c['id'] for c in q.choices if c.get('is_correct'))
-        is_correct = set(selected) == correct_ids
+        correct_answers_display = [c.get('text', '') for c in q.choices if c.get('is_correct')]
+        is_correct = bool(correct_ids) and set(selected) == correct_ids
     elif q.question_type == 'fill_blank':
         text_val = str(request.data.get('text_response', '')).strip().lower()
-        correct_answers = [str(c.get('text', '')).strip().lower() for c in q.choices if c.get('is_correct')]
-        is_correct = text_val in correct_answers
+        raw_correct = [c.get('text', '') for c in q.choices if c.get('is_correct')] or [c.get('text', '') for c in q.choices]
+        correct_answers_display = [t for t in raw_correct if t]
+        normalized_correct = [str(t).strip().lower() for t in correct_answers_display]
+        is_correct = bool(text_val and text_val in normalized_correct)
 
     score_earned = q.points if is_correct else 0
     feedback = q.correct_feedback if is_correct else q.incorrect_feedback
@@ -236,6 +242,7 @@ def evaluate_kc_question(request, question_id):
     return Response({
         'question_id': q.id,
         'is_correct': is_correct,
+        'correct_answers': correct_answers_display,
         'score_earned': score_earned,
         'max_points': q.points,
         'feedback': feedback,

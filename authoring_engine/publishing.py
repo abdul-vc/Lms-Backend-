@@ -132,7 +132,8 @@ def compile_course_manifest(course):
                     if hasattr(b, 'reading_payload') and b.reading_payload:
                         b_data['payload'] = {
                             'html': b.reading_payload.html_content,
-                            'markdown': b.reading_payload.markdown_content
+                            'markdown': b.reading_payload.markdown_content,
+                            'meta_data': b.reading_payload.meta_data,
                         }
                     elif hasattr(b, 'interaction_payload') and b.interaction_payload:
                         b_data['payload'] = {
