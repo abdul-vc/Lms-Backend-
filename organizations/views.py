@@ -519,6 +519,7 @@ class MyWorkspacesView(APIView):
                                 'roles_permissions': 'roles_permissions',
                                 'module_access': 'module_access',
                                 'activity_log': 'activity_log',
+                                'assessment_activity': 'assessment_activity',
                                 'pending_registration': 'pending_registration',
                             }
                             feat_key = key_map.get(item.key, item.key)

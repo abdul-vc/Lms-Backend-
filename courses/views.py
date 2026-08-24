@@ -1696,5 +1696,432 @@ def dashboard_badges(request):
     return Response({'badges': data_dict.get('achievements', []) or data_dict.get('badges', [])})
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsOrgScoped])
+def org_admin_assessment_activity(request):
+    """
+    GET /api/courses/org-admin/assessment-activity/
+    Returns real, tenant-isolated assessment attempt history for lesson-specific assessments.
+    Supports filtering by course, module, lesson, user, department, role, result (passed/failed), date range, and search.
+    Calculates attempt sequence number (Attempt 1, 2, 3...) and total attempts for each (user, lesson) pair.
+    """
+    from django.db.models import Q
+    from django.utils.dateparse import parse_date
+    from datetime import datetime, time
+    from .models import AssessmentAttempt, AssessmentQuestion, Course, Module, Lesson
+    from organizations.models import Department, Role
+    from users.models import User
+
+    # Tenant scoping: Super admin can filter or pass org; Org Admin strictly bounded to own org
+    if request.user.is_platform_super_admin:
+        org_id = request.GET.get('organization_id') or request.user.organization_id
+    else:
+        org_id = request.user.organization_id
+
+    if not org_id and not request.user.is_platform_super_admin:
+        return Response({'results': [], 'filter_options': {}}, status=status.HTTP_200_OK)
+
+    # Access Control Feature check
+    if org_id and not request.user.is_platform_super_admin:
+        from master_setup.models import OrganizationFeatureAccess
+        org_access = OrganizationFeatureAccess.objects.filter(
+            organization_id=org_id,
+            feature__key='assessment_activity'
+        ).first()
+        if org_access is not None and not org_access.enabled:
+            return Response({'error': 'Assessment Activity module is disabled for your organization.'}, status=status.HTTP_403_FORBIDDEN)
+
+    base_filter = Q(lesson__isnull=False)
+    if org_id:
+        base_filter &= Q(course__organization_id=org_id)
+
+    qs = AssessmentAttempt.objects.filter(base_filter).select_related(
+        'user',
+        'user__department',
+        'user__role',
+        'course',
+        'lesson',
+        'lesson__module',
+    )
+
+    # ─── FILTERS ─────────────────────────────────────────────────────────────
+    course_id = request.GET.get('course_id')
+    if course_id:
+        qs = qs.filter(course_id=course_id)
+
+    module_id = request.GET.get('module_id')
+    if module_id:
+        qs = qs.filter(lesson__module_id=module_id)
+
+    lesson_id = request.GET.get('lesson_id')
+    if lesson_id:
+        qs = qs.filter(lesson_id=lesson_id)
+
+    user_id = request.GET.get('user_id')
+    if user_id:
+        qs = qs.filter(user_id=user_id)
+
+    department_id = request.GET.get('department_id')
+    if department_id:
+        qs = qs.filter(user__department_id=department_id)
+
+    role_id = request.GET.get('role_id')
+    if role_id:
+        qs = qs.filter(user__role_id=role_id)
+
+    result_filter = request.GET.get('result', '').lower()
+    if result_filter == 'passed':
+        qs = qs.filter(passed=True, submitted_at__isnull=False)
+    elif result_filter == 'failed':
+        qs = qs.filter(passed=False, submitted_at__isnull=False)
+    elif result_filter == 'in_progress':
+        qs = qs.filter(submitted_at__isnull=True)
+
+    date_from = request.GET.get('date_from')
+    if date_from:
+        d_from = parse_date(date_from)
+        if d_from:
+            qs = qs.filter(started_at__gte=datetime.combine(d_from, time.min))
+
+    date_to = request.GET.get('date_to')
+    if date_to:
+        d_to = parse_date(date_to)
+        if d_to:
+            qs = qs.filter(started_at__lte=datetime.combine(d_to, time.max))
+
+    search = request.GET.get('search', '').strip()
+    if search:
+        qs = qs.filter(
+            Q(user__first_name__icontains=search) |
+            Q(user__last_name__icontains=search) |
+            Q(user__username__icontains=search) |
+            Q(user__email__icontains=search) |
+            Q(course__title__icontains=search) |
+            Q(lesson__title__icontains=search)
+        )
+
+    # ─── CHRONOLOGICAL ATTEMPT NUMBERING INDEX ──────────────────────────────
+    all_attempts_for_org = list(
+        AssessmentAttempt.objects.filter(base_filter)
+        .values_list('user_id', 'lesson_id', 'id', 'started_at')
+        .order_by('started_at', 'id')
+    )
+
+    pair_attempt_map = {}
+    for u_id, l_id, att_id, _ in all_attempts_for_org:
+        key = (u_id, l_id)
+        if key not in pair_attempt_map:
+            pair_attempt_map[key] = []
+        pair_attempt_map[key].append(att_id)
+
+    # Apply ordering to filtered QuerySet
+    ordering = request.GET.get('ordering', '-started_at')
+    valid_orderings = {
+        'started_at': 'started_at',
+        '-started_at': '-started_at',
+        'submitted_at': 'submitted_at',
+        '-submitted_at': '-submitted_at',
+        'score_percent': 'score_percent',
+        '-score_percent': '-score_percent',
+        'user': 'user__first_name',
+        '-user': '-user__first_name',
+        'course': 'course__title',
+        '-course': '-course__title',
+    }
+    order_field = valid_orderings.get(ordering, '-started_at')
+    qs = qs.order_by(order_field)
+
+    # ─── BATCH QUESTION LOOKUP FOR CORRECT / WRONG COUNTS ───────────────────
+    attempts_list = list(qs)
+    all_question_ids = set()
+    for att in attempts_list:
+        if att.question_ids and isinstance(att.question_ids, list):
+            for qid in att.question_ids:
+                if isinstance(qid, int):
+                    all_question_ids.add(qid)
+                elif isinstance(qid, str) and qid.isdigit():
+                    all_question_ids.add(int(qid))
+
+    question_correct_map = {}
+    if all_question_ids:
+        for q in AssessmentQuestion.objects.filter(id__in=all_question_ids).values('id', 'correct_option'):
+            question_correct_map[str(q['id'])] = str(q['correct_option']).strip().upper()
+
+    opt_map = {'0': 'A', '1': 'B', '2': 'C', '3': 'D', 'A': 'A', 'B': 'B', 'C': 'C', 'D': 'D'}
+
+    # ─── SERIALIZE ROWS ─────────────────────────────────────────────────────
+    rows = []
+    for att in attempts_list:
+        pair_key = (att.user_id, att.lesson_id)
+        history_list = pair_attempt_map.get(pair_key, [])
+        try:
+            attempt_number = history_list.index(att.id) + 1
+        except ValueError:
+            attempt_number = 1
+        total_attempts = len(history_list) or 1
+
+        # Question counts & accuracy
+        q_ids = att.question_ids if (att.question_ids and isinstance(att.question_ids, list)) else []
+        total_questions = len(q_ids) if q_ids else (len(att.answers) if att.answers else 0)
+        
+        correct_count = 0
+        answers = att.answers if isinstance(att.answers, dict) else {}
+        for q_id_raw, user_ans in answers.items():
+            str_qid = str(q_id_raw)
+            expected = question_correct_map.get(str_qid)
+            if expected:
+                normalized_user = opt_map.get(str(user_ans).strip().upper(), str(user_ans).strip().upper())
+                if normalized_user == expected:
+                    correct_count += 1
+
+        wrong_count = max(0, total_questions - correct_count)
+        score_val = att.score_percent if att.score_percent is not None else (
+            int((correct_count / total_questions) * 100) if total_questions > 0 else 0
+        )
+
+        # Status & Result
+        if not att.submitted_at:
+            result_str = "In Progress"
+            status_str = "In Progress"
+        elif att.passed:
+            result_str = "Passed"
+            status_str = "Passed"
+        else:
+            result_str = "Failed"
+            status_str = "Failed"
+
+        # User Department & Role
+        dept_name = att.user.department.name if (att.user and getattr(att.user, 'department', None)) else None
+        role_name = att.user.role.name if (att.user and getattr(att.user, 'role', None)) else None
+
+        user_full_name = att.user.full_name if (att.user and hasattr(att.user, 'full_name') and att.user.full_name) else (
+            f"{att.user.first_name} {att.user.last_name}".strip() if (att.user and (att.user.first_name or att.user.last_name)) else (
+                att.user.username if att.user else "Unknown User"
+            )
+        )
+
+        rows.append({
+            'id': att.id,
+            'user_id': att.user_id,
+            'user_name': user_full_name,
+            'user_email': att.user.email if att.user else '',
+            'department_id': att.user.department_id if att.user else None,
+            'department_name': dept_name,
+            'role_id': att.user.role_id if att.user else None,
+            'role_name': role_name,
+            'course_id': att.course_id,
+            'course_name': att.course.title if att.course else 'Unknown Course',
+            'module_id': att.lesson.module_id if (att.lesson and att.lesson.module_id) else None,
+            'module_name': att.lesson.module.title if (att.lesson and att.lesson.module) else '-',
+            'lesson_id': att.lesson_id,
+            'lesson_name': att.lesson.title if att.lesson else 'Unknown Lesson',
+            'assessment_name': f"{att.lesson.title} Assessment" if att.lesson else "Lesson Assessment",
+            'assessment_type': "Lesson Assessment",
+            'attempt_number': attempt_number,
+            'total_attempts': total_attempts,
+            'started_at': att.started_at.isoformat() if att.started_at else None,
+            'submitted_at': att.submitted_at.isoformat() if att.submitted_at else None,
+            'score': f"{correct_count} / {total_questions}" if total_questions > 0 else (f"{score_val}%" if att.submitted_at else "-"),
+            'score_percent': score_val if att.submitted_at else None,
+            'percentage': f"{score_val}%" if att.submitted_at else "-",
+            'result': result_str,
+            'status': status_str,
+            'questions_attempted': total_questions,
+            'correct_answers': correct_count,
+            'wrong_answers': wrong_count,
+            'auto_submitted': att.auto_submitted,
+        })
+
+    # ─── TENANT FILTER OPTIONS METADATA ─────────────────────────────────────
+    courses_meta = list(
+        Course.objects.filter(organization_id=org_id).values('id', 'title').order_by('title')
+    ) if org_id else []
+
+    modules_meta = list(
+        Module.objects.filter(course__organization_id=org_id).values('id', 'title', 'course_id').order_by('order', 'title')
+    ) if org_id else []
+
+    lessons_meta = list(
+        Lesson.objects.filter(module__course__organization_id=org_id, type='assessment').values('id', 'title', 'module_id', 'module__course_id').order_by('order', 'title')
+    ) if org_id else []
+
+    departments_meta = list(
+        Department.objects.filter(organization_id=org_id).values('id', 'name').order_by('name')
+    ) if org_id else []
+
+    roles_meta = list(
+        Role.objects.filter(organization_id=org_id).values('id', 'name').order_by('name')
+    ) if org_id else []
+
+    users_meta = list(
+        User.objects.filter(organization_id=org_id, is_active=True).values('id', 'first_name', 'last_name', 'username', 'email').order_by('first_name', 'last_name')
+    ) if org_id else []
+
+    formatted_users = [
+        {
+            'id': u['id'],
+            'name': f"{u['first_name']} {u['last_name']}".strip() or u['username'],
+            'email': u['email']
+        }
+        for u in users_meta
+    ]
+
+    return Response({
+        'results': rows,
+        'total_count': len(rows),
+        'filter_options': {
+            'courses': courses_meta,
+            'modules': modules_meta,
+            'lessons': lessons_meta,
+            'departments': departments_meta,
+            'roles': roles_meta,
+            'users': formatted_users,
+        }
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsOrgScoped])
+def org_admin_assessment_attempt_detail(request, attempt_id):
+    """
+    GET /api/courses/org-admin/assessment-activity/<attempt_id>/
+    Returns detailed attempt metadata plus question-by-question breakdown for lesson assessment attempts.
+    Strictly isolated to requesting Org Admin's organization.
+    """
+    if request.user.is_platform_super_admin:
+        org_id = request.GET.get('organization_id') or request.user.organization_id
+    else:
+        org_id = request.user.organization_id
+
+    if not org_id and not request.user.is_platform_super_admin:
+        return Response({'error': 'Organization context required.'}, status=status.HTTP_403_FORBIDDEN)
+
+    # Access Control Feature check
+    if org_id and not request.user.is_platform_super_admin:
+        from master_setup.models import OrganizationFeatureAccess
+        org_access = OrganizationFeatureAccess.objects.filter(
+            organization_id=org_id,
+            feature__key='assessment_activity'
+        ).first()
+        if org_access is not None and not org_access.enabled:
+            return Response({'error': 'Assessment Activity module is disabled for your organization.'}, status=status.HTTP_403_FORBIDDEN)
+
+    try:
+        if request.user.is_platform_super_admin:
+            attempt = AssessmentAttempt.objects.select_related(
+                'user', 'user__department', 'user__role', 'course', 'lesson', 'lesson__module'
+            ).get(pk=attempt_id, lesson__isnull=False)
+        else:
+            attempt = AssessmentAttempt.objects.select_related(
+                'user', 'user__department', 'user__role', 'course', 'lesson', 'lesson__module'
+            ).get(pk=attempt_id, course__organization_id=org_id, lesson__isnull=False)
+    except AssessmentAttempt.DoesNotExist:
+        return Response({'error': 'Assessment attempt not found or unauthorized.'}, status=status.HTTP_404_NOT_FOUND)
+
+    # Attempt sequence calculation
+    pair_attempts = list(
+        AssessmentAttempt.objects.filter(user_id=attempt.user_id, lesson_id=attempt.lesson_id)
+        .order_by('started_at', 'id')
+        .values_list('id', flat=True)
+    )
+    try:
+        attempt_number = pair_attempts.index(attempt.id) + 1
+    except ValueError:
+        attempt_number = 1
+    total_attempts = len(pair_attempts) or 1
+
+    # Questions breakdown
+    q_ids = attempt.question_ids if (attempt.question_ids and isinstance(attempt.question_ids, list)) else []
+    if not q_ids and attempt.lesson_id:
+        q_ids = list(AssessmentQuestion.objects.filter(lesson_id=attempt.lesson_id).values_list('id', flat=True))
+
+    questions_qs = AssessmentQuestion.objects.filter(id__in=q_ids)
+    q_map = {q.id: q for q in questions_qs}
+    ordered_questions = [q_map[qid] for qid in q_ids if qid in q_map]
+
+    opt_map = {'0': 'A', '1': 'B', '2': 'C', '3': 'D', 'A': 'A', 'B': 'B', 'C': 'C', 'D': 'D'}
+    answers = attempt.answers if isinstance(attempt.answers, dict) else {}
+
+    question_details = []
+    correct_count = 0
+
+    for idx, q in enumerate(ordered_questions, 1):
+        str_qid = str(q.id)
+        raw_user_ans = answers.get(str_qid)
+        user_choice_letter = opt_map.get(str(raw_user_ans).strip().upper(), str(raw_user_ans).strip().upper()) if raw_user_ans is not None else None
+        correct_letter = str(q.correct_option).strip().upper()
+
+        is_correct = (user_choice_letter == correct_letter) if user_choice_letter else False
+        if is_correct:
+            correct_count += 1
+
+        options = [
+            {'key': 'A', 'text': q.option_a},
+            {'key': 'B', 'text': q.option_b},
+            {'key': 'C', 'text': q.option_c},
+            {'key': 'D', 'text': q.option_d},
+        ]
+
+        def get_opt_text(letter):
+            for opt in options:
+                if opt['key'] == letter:
+                    return opt['text']
+            return '-'
+
+        question_details.append({
+            'question_number': idx,
+            'question_id': q.id,
+            'question_text': q.question_text,
+            'options': options,
+            'user_answer': user_choice_letter,
+            'user_answer_text': get_opt_text(user_choice_letter) if user_choice_letter else 'No answer submitted',
+            'correct_option': correct_letter,
+            'correct_option_text': get_opt_text(correct_letter),
+            'is_correct': is_correct,
+            'explanation': q.explanation or '',
+        })
+
+    total_q_count = len(ordered_questions)
+    wrong_count = max(0, total_q_count - correct_count)
+    score_val = attempt.score_percent if attempt.score_percent is not None else (
+        int((correct_count / total_q_count) * 100) if total_q_count > 0 else 0
+    )
+
+    user_full_name = attempt.user.full_name if (attempt.user and hasattr(attempt.user, 'full_name') and attempt.user.full_name) else (
+        f"{attempt.user.first_name} {attempt.user.last_name}".strip() if (attempt.user and (attempt.user.first_name or attempt.user.last_name)) else (
+            attempt.user.username if attempt.user else "Unknown User"
+        )
+    )
+
+    dept_name = attempt.user.department.name if (attempt.user and getattr(attempt.user, 'department', None)) else None
+    role_name = attempt.user.role.name if (attempt.user and getattr(attempt.user, 'role', None)) else None
+
+    return Response({
+        'id': attempt.id,
+        'user_name': user_full_name,
+        'user_email': attempt.user.email if attempt.user else '',
+        'department_name': dept_name,
+        'role_name': role_name,
+        'course_name': attempt.course.title if attempt.course else 'Unknown Course',
+        'module_name': attempt.lesson.module.title if (attempt.lesson and attempt.lesson.module) else '-',
+        'lesson_name': attempt.lesson.title if attempt.lesson else 'Unknown Lesson',
+        'assessment_name': f"{attempt.lesson.title} Assessment" if attempt.lesson else "Lesson Assessment",
+        'attempt_number': attempt_number,
+        'total_attempts': total_attempts,
+        'started_at': attempt.started_at.isoformat() if attempt.started_at else None,
+        'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        'score': f"{correct_count} / {total_q_count}" if total_q_count > 0 else (f"{score_val}%" if attempt.submitted_at else "-"),
+        'score_percent': score_val if attempt.submitted_at else None,
+        'percentage': f"{score_val}%" if attempt.submitted_at else "-",
+        'result': "Passed" if attempt.passed else ("In Progress" if not attempt.submitted_at else "Failed"),
+        'status': "Passed" if attempt.passed else ("In Progress" if not attempt.submitted_at else "Failed"),
+        'questions_attempted': total_q_count,
+        'correct_answers': correct_count,
+        'wrong_answers': wrong_count,
+        'auto_submitted': attempt.auto_submitted,
+        'questions': question_details,
+    }, status=status.HTTP_200_OK)
+
+
 
 

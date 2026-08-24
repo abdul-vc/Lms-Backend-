@@ -24,6 +24,7 @@ class Command(BaseCommand):
             ('analytics', 'Reports & Analytics', 'Comprehensive platform & tenant analytics', 'reporting'),
             ('site_management', 'Multi-Site Management', 'Sub-domain routing and portal management', 'administration'),
             ('billing_management', 'Subscription & Billing', 'Tenant plans, subscriptions, and invoicing', 'billing'),
+            ('assessment_activity', 'Assessment Activity', 'Track and review user lesson assessment attempts and performance', 'reporting'),
         ]
 
         feature_map = {}
@@ -44,6 +45,7 @@ class Command(BaseCommand):
             ('learning_paths_admin', 'Learning Paths', 'Route', '/org-admin/paths', 'learning_paths', 'can_edit_courses'),
             ('certificates_admin', 'Certificates', 'Award', '/org-admin/certificates', 'certifications', 'can_manage_certificates'),
             ('activity_log', 'Activity Log', 'History', '/org-admin/activity', 'activity_log', 'is_admin_role'),
+            ('assessment_activity', 'Assessment Activity', 'CheckSquare', '/org-admin/assessment-activity', 'assessment_activity', 'can_view_reports'),
             ('content_authoring', 'Content Authoring', 'PenTool', '/authoring', 'content_authoring', 'can_create_courses'),
             ('pending_registration', 'Pending Registration', 'UserPlus', '/pending-registration', 'pending_registration', 'can_manage_users'),
             ('messenger', 'Messenger', 'MessageSquare', '/messenger', 'internal_messenger', ''),

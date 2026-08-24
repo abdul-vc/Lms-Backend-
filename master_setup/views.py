@@ -53,6 +53,7 @@ class FeatureViewSet(viewsets.ModelViewSet):
             ('site_management', 'Multi-Site Management', 'Sub-domain routing and portal management', 'administration'),
             ('billing_management', 'Subscription & Billing', 'Tenant plans, subscriptions, and invoicing', 'billing'),
             ('admin_console', 'Admin Console', 'Organization administration console', 'advanced'),
+            ('assessment_activity', 'Assessment Activity', 'Track and review user lesson assessment attempts and performance', 'reporting'),
         ]
         try:
             for key, name, desc, cat in features_to_seed:
@@ -95,6 +96,7 @@ class OrgFeatureAccessView(APIView):
             ('site_management', 'Multi-Site Management', 'Sub-domain routing and portal management', 'administration'),
             ('billing_management', 'Subscription & Billing', 'Tenant plans, subscriptions, and invoicing', 'billing'),
             ('admin_console', 'Admin Console', 'Organization administration console', 'advanced'),
+            ('assessment_activity', 'Assessment Activity', 'Track and review user lesson assessment attempts and performance', 'reporting'),
         ]
         for key, name, desc, cat in features_to_seed:
             Feature.objects.update_or_create(
