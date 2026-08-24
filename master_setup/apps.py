@@ -12,6 +12,6 @@ class MasterSetupConfig(AppConfig):
                 from django.core.management import call_command
                 call_command('makemigrations', 'master_setup', 'organizations', 'courses', 'users', interactive=False)
                 call_command('migrate', interactive=False)
-                call_command('seed_workspaces', interactive=False)
+                call_command('seed_workspaces')
             except Exception as e:
                 print(f"Auto migration warning: {e}")

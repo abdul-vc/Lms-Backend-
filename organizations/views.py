@@ -470,11 +470,14 @@ class MyWorkspacesView(APIView):
         from master_setup.models import Workspace, NavItem, SiteFeatureAccess
         from django.core.management import call_command
 
-        if not NavItem.objects.filter(key='messenger').exists():
-            try:
+        try:
+            from organizations.management.commands.seed_workspaces import ADMIN_NAV_ITEMS, LEARNER_NAV_ITEMS
+            expected_keys = {item[0] for item in ADMIN_NAV_ITEMS} | {item[0] for item in LEARNER_NAV_ITEMS}
+            existing_keys = set(NavItem.objects.values_list('key', flat=True))
+            if not expected_keys.issubset(existing_keys):
                 call_command('seed_workspaces')
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # Resolve workspaces dynamically based on account type and role
         if user.is_platform_super_admin:
