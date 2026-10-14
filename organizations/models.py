@@ -319,3 +319,65 @@ class ActivityLog(models.Model):
             models.Index(fields=['actor', '-created_at']),
             models.Index(fields=['action', '-created_at']),
         ]
+
+
+class ExternalTenantMapping(models.Model):
+    provider = models.CharField(max_length=50)
+    external_tenant_id = models.CharField(max_length=255)
+    organization = models.ForeignKey(
+        'organizations.Organization',
+        on_delete=models.CASCADE,
+        related_name='external_tenant_mappings'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'external_tenant_mapping'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['provider', 'external_tenant_id'],
+                name='uniq_ext_tenant_provider_external_id'
+            ),
+            models.UniqueConstraint(
+                fields=['provider', 'organization'],
+                name='uniq_ext_tenant_provider_organization'
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.provider}:{self.external_tenant_id} -> Org {self.organization_id} ({self.organization.name})"
+
+
+class ExternalUserMapping(models.Model):
+    provider = models.CharField(max_length=50)
+    external_user_id = models.CharField(max_length=255)
+    organization = models.ForeignKey(
+        'organizations.Organization',
+        on_delete=models.CASCADE,
+        related_name='external_user_mappings'
+    )
+    user = models.ForeignKey(
+        'users.User',
+        on_delete=models.CASCADE,
+        related_name='external_user_mappings'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'external_user_mapping'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['provider', 'external_user_id'],
+                name='uniq_ext_user_provider_external_id'
+            ),
+            models.UniqueConstraint(
+                fields=['provider', 'user'],
+                name='uniq_ext_user_provider_user'
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.provider}:{self.external_user_id} -> User {self.user_id} ({self.user.username})"
+

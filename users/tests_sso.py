@@ -1,0 +1,522 @@
+import json
+import urllib.error
+from unittest.mock import patch, MagicMock
+from io import BytesIO
+
+from django.test import TestCase, override_settings
+from django.contrib.auth import get_user_model
+from rest_framework_simplejwt.tokens import AccessToken
+
+from organizations.models import Organization, ExternalTenantMapping, ExternalUserMapping
+from organizations.mapping_services import create_tenant_mapping, create_user_mapping
+
+User = get_user_model()
+
+
+@override_settings(
+    VIBECONNECT_API_BASE_URL='https://mock-vibeconnect.internal',
+    VIBECONNECT_SSO_CLIENT_ID='pilot_lms_client',
+    VIBECONNECT_M2M_SECRET='test-super-secret-m2m-token-12345',
+    VIBECONNECT_SSO_AUDIENCE='vibeconnect-lms',
+    VIBECONNECT_HTTP_TIMEOUT=5
+)
+class SSOCallbackTestCase(TestCase):
+    def setUp(self):
+        # 1. Pilot Organization (Active)
+        self.org = Organization.objects.create(
+            name="Pilot Acme Corp",
+            company_name="Pilot Acme Corporation",
+            entity_name="Pilot Acme Corp",
+            sub_domain="pilot-acme",
+            status="Active"
+        )
+        self.other_org = Organization.objects.create(
+            name="Other Corp",
+            company_name="Other Corporation",
+            entity_name="Other Corp",
+            sub_domain="other-corp",
+            status="Active"
+        )
+        self.inactive_org = Organization.objects.create(
+            name="Frozen Corp",
+            company_name="Frozen Corporation",
+            entity_name="Frozen Corp",
+            sub_domain="frozen-corp",
+            status="Inactive"
+        )
+
+        # 2. Pilot User (Active)
+        self.user = User.objects.create_user(
+            username="pilot.john@acme.com",
+            email="pilot.john@acme.com",
+            password="TestPassword123!",
+            organization=self.org,
+            is_active=True
+        )
+
+        # Inactive User
+        self.inactive_user = User.objects.create_user(
+            username="inactive.john@acme.com",
+            email="inactive.john@acme.com",
+            password="TestPassword123!",
+            organization=self.org,
+            is_active=False
+        )
+
+        # Cross-Tenant User (belongs to other_org)
+        self.cross_tenant_user = User.objects.create_user(
+            username="other.jane@other.com",
+            email="other.jane@other.com",
+            password="TestPassword123!",
+            organization=self.other_org,
+            is_active=True
+        )
+
+        # 3. Canonical external identifiers (UUIDs)
+        self.ext_tenant_id = "org_pilot_uuid_101"
+        self.ext_user_id = "usr_vc_uuid_98765"
+        self.other_ext_tenant_id = "org_other_uuid_202"
+
+        # 4. Map Tenant to Org
+        self.tenant_mapping = create_tenant_mapping(
+            provider="vibeconnect",
+            external_tenant_id=self.ext_tenant_id,
+            organization=self.org
+        )
+
+        # Map User to Pilot User
+        self.user_mapping = create_user_mapping(
+            provider="vibeconnect",
+            external_user_id=self.ext_user_id,
+            organization=self.org,
+            user=self.user
+        )
+
+        # Canonical valid VibeConnect claims
+        self.valid_claims = {
+            "user": {
+                "id": self.ext_user_id,
+                "email": "pilot.john@acme.com",
+                "full_name": "John Pilot"
+            },
+            "organization": {
+                "id": self.ext_tenant_id,
+                "code": "acme",
+                "name": "Pilot Acme Corp"
+            },
+            "product": {
+                "id": "prod_lms_uuid",
+                "code": "lms",
+                "name": "Learning Management System"
+            },
+            "assignment_id": "asgn_uuid_456",
+            "audience": "vibeconnect-lms"
+        }
+
+    def _mock_vibeconnect_response(self, data, status_code=200):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(data).encode('utf-8')
+        mock_resp.getcode.return_value = status_code
+        mock_resp.__enter__.return_value = mock_resp
+        return mock_resp
+
+    # ─── 1 & 2. INPUT VALIDATION ─────────────────────────────────────────────
+
+    def test_missing_code_returns_400(self):
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code_verifier": "valid_verifier_string"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()['error'], 'invalid_request')
+
+        # Blank code
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "   ", "code_verifier": "valid_verifier_string"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()['error'], 'invalid_request')
+
+    @patch('urllib.request.urlopen')
+    def test_no_pkce_master_initiated_success(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_vibeconnect_response(self.valid_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_auth_code_abc"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+
+        self.assertIn('access', data)
+        self.assertIn('refresh', data)
+        self.assertIn('user', data)
+        self.assertEqual(data['user']['id'], self.user.id)
+        self.assertEqual(data['user']['email'], self.user.email)
+
+        # Verify outbound VibeConnect request payload
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode('utf-8'))
+        self.assertEqual(payload['code'], 'valid_auth_code_abc')
+        self.assertEqual(payload['client_identifier'], 'pilot_lms_client')
+        self.assertNotIn('code_verifier', payload)
+
+    @patch('urllib.request.urlopen')
+    def test_pkce_backward_compatibility(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_vibeconnect_response(self.valid_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_auth_code_abc", "code_verifier": "verifier_abc"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        # Verify outbound payload includes forwarded code_verifier
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode('utf-8'))
+        self.assertEqual(payload['code'], 'valid_auth_code_abc')
+        self.assertEqual(payload['client_identifier'], 'pilot_lms_client')
+        self.assertEqual(payload['code_verifier'], 'verifier_abc')
+
+    @patch('urllib.request.urlopen')
+    def test_blank_code_verifier_treated_as_no_pkce(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_vibeconnect_response(self.valid_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_auth_code_abc", "code_verifier": "   "},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        # Blank code_verifier should be omitted from outbound payload
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode('utf-8'))
+        self.assertNotIn('code_verifier', payload)
+
+    # ─── 3. MALFORMED VIBECONNECT RESPONSE ───────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_malformed_vibeconnect_response_handled_cleanly(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"<html>502 Bad Gateway</html>"
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "code_1", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertIn(resp.status_code, [403, 500, 502])
+        self.assertEqual(resp.json()['error'], 'malformed_response')
+
+    # ─── 4. VIBECONNECT 401 UNAUTHORIZED ─────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_vibeconnect_401_returns_unauthorized(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url='https://mock-vibeconnect.internal/api/v1/sso/validate/',
+            code=401,
+            msg='Unauthorized',
+            hdrs={},
+            fp=BytesIO(b'{"detail": "Invalid connector token"}')
+        )
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "code_1", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()['error'], 'sso_unauthorized')
+
+    # ─── 5. VIBECONNECT INVALID/EXPIRED CODE ─────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_vibeconnect_invalid_code_returns_sso_failed(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url='https://mock-vibeconnect.internal/api/v1/sso/validate/',
+            code=400,
+            msg='Bad Request',
+            hdrs={},
+            fp=BytesIO(b'{"error": "invalid_grant", "detail": "Code expired"}')
+        )
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "expired_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()['error'], 'sso_failed')
+
+    # ─── 6. INVALID AUDIENCE ─────────────────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_invalid_audience_rejected_with_403(self, mock_urlopen):
+        bad_claims = dict(self.valid_claims)
+        bad_claims['audience'] = 'untrusted-rogue-audience'
+        mock_urlopen.return_value = self._mock_vibeconnect_response(bad_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'invalid_audience')
+
+    # ─── 7. INVALID PRODUCT CODE ─────────────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_invalid_product_rejected_with_403(self, mock_urlopen):
+        bad_claims = dict(self.valid_claims)
+        bad_claims['product'] = {"id": "prod_hrms", "code": "hrms", "name": "HRMS"}
+        mock_urlopen.return_value = self._mock_vibeconnect_response(bad_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'invalid_product')
+
+    # ─── 8. UNMAPPED TENANT ──────────────────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_unmapped_tenant_rejected_with_403(self, mock_urlopen):
+        unmapped_claims = dict(self.valid_claims)
+        unmapped_claims['organization'] = {
+            "id": "unmapped_tenant_9999",
+            "code": "unknown",
+            "name": "Unknown Corp"
+        }
+        mock_urlopen.return_value = self._mock_vibeconnect_response(unmapped_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'unmapped_tenant')
+
+    # ─── 9. UNMAPPED USER ────────────────────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_unmapped_user_rejected_with_403(self, mock_urlopen):
+        unmapped_claims = dict(self.valid_claims)
+        unmapped_claims['user'] = {
+            "id": "unmapped_user_8888",
+            "email": "new.user@acme.com",
+            "full_name": "New User"
+        }
+        mock_urlopen.return_value = self._mock_vibeconnect_response(unmapped_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'unmapped_user')
+
+    # ─── 10. CROSS-TENANT MISMATCH ───────────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_cross_tenant_mismatch_rejected_with_403(self, mock_urlopen):
+        # Map other_ext_tenant_id to other_org
+        create_tenant_mapping("vibeconnect", self.other_ext_tenant_id, self.other_org)
+
+        # Claims claim to be from other_ext_tenant_id, but the user is mapped to self.org
+        mismatch_claims = dict(self.valid_claims)
+        mismatch_claims['organization'] = {
+            "id": self.other_ext_tenant_id,
+            "code": "other",
+            "name": "Other Corp"
+        }
+        # user self.ext_user_id is mapped to self.org
+        mock_urlopen.return_value = self._mock_vibeconnect_response(mismatch_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'tenant_mismatch')
+
+    # ─── 11. INACTIVE USER ───────────────────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_inactive_user_rejected_with_403(self, mock_urlopen):
+        # Map inactive user
+        create_user_mapping("vibeconnect", "usr_inactive_111", self.org, self.inactive_user)
+
+        inactive_claims = dict(self.valid_claims)
+        inactive_claims['user'] = {
+            "id": "usr_inactive_111",
+            "email": self.inactive_user.email,
+            "full_name": "Inactive User"
+        }
+        mock_urlopen.return_value = self._mock_vibeconnect_response(inactive_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'account_frozen')
+
+    # ─── 12. INACTIVE ORGANIZATION ───────────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_inactive_organization_rejected_with_403(self, mock_urlopen):
+        # Map inactive organization
+        create_tenant_mapping("vibeconnect", "org_frozen_777", self.inactive_org)
+        # Create user in inactive organization
+        frozen_user = User.objects.create_user(
+            username="frozen.john@frozen.com",
+            email="frozen.john@frozen.com",
+            organization=self.inactive_org,
+            is_active=True
+        )
+        create_user_mapping("vibeconnect", "usr_frozen_222", self.inactive_org, frozen_user)
+
+        frozen_claims = dict(self.valid_claims)
+        frozen_claims['organization'] = {"id": "org_frozen_777", "code": "frozen", "name": "Frozen Corp"}
+        frozen_claims['user'] = {"id": "usr_frozen_222", "email": frozen_user.email, "full_name": "Frozen User"}
+        mock_urlopen.return_value = self._mock_vibeconnect_response(frozen_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_code", "code_verifier": "verifier_1"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'account_frozen')
+
+    # ─── 13 & 14. SUCCESSFUL SESSION CREATION & CLAIM EMBEDDING ──────────────
+
+    @patch('urllib.request.urlopen')
+    def test_successful_mapped_user_returns_tokens_with_claims(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_vibeconnect_response(self.valid_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_auth_code_abc", "code_verifier": "valid_pkce_verifier_xyz"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+
+        self.assertIn('access', data)
+        self.assertIn('refresh', data)
+        self.assertIn('user', data)
+        self.assertEqual(data['user']['id'], self.user.id)
+        self.assertEqual(data['user']['email'], self.user.email)
+
+        # Inspect decoded access token claims
+        token = AccessToken(data['access'])
+        self.assertEqual(int(token['user_id']), self.user.id)
+        self.assertEqual(token['org_id'], self.org.id)
+        self.assertEqual(token['is_platform_super_admin'], False)
+
+    # ─── 15 & 16. M2M SECRET CONFIDENTIALITY ────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_m2m_secret_sent_in_header_only_and_never_leaked(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_vibeconnect_response(self.valid_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_auth_code_abc", "code_verifier": "valid_pkce_verifier_xyz"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        # Verify outbound call used Authorization Bearer header
+        req = mock_urlopen.call_args[0][0]
+        auth_header = req.get_header('Authorization')
+        self.assertEqual(auth_header, 'Bearer test-super-secret-m2m-token-12345')
+
+        # Verify M2M secret is never leaked in the HTTP response body
+        resp_text = resp.content.decode('utf-8')
+        self.assertNotIn('test-super-secret-m2m-token-12345', resp_text)
+
+    # ─── 17 & 18. IDENTITY INDEPENDENCE ──────────────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_external_identity_and_local_user_id_remain_independent(self, mock_urlopen):
+        mock_urlopen.return_value = self._mock_vibeconnect_response(self.valid_claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_auth_code_abc", "code_verifier": "valid_pkce_verifier_xyz"},
+            content_type='application/json'
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+
+        # Local user ID is integer primary key
+        self.assertEqual(data['user']['id'], self.user.id)
+        self.assertIsInstance(data['user']['id'], int)
+
+        # External mapping preserves VibeConnect PlatformUser UUID
+        mapping = ExternalUserMapping.objects.get(user=self.user)
+        self.assertEqual(mapping.external_user_id, self.ext_user_id)
+        self.assertNotEqual(mapping.external_user_id, str(self.user.id))
+
+    # ─── 19. NO EMAIL-BASED IDENTITY SUBSTITUTION ────────────────────────────
+
+    @patch('urllib.request.urlopen')
+    def test_no_email_based_identity_substitution(self, mock_urlopen):
+        # Create an unmapped user with matching email
+        unmapped_user = User.objects.create_user(
+            username="unmapped.email@acme.com",
+            email="unmapped.email@acme.com",
+            organization=self.org,
+            is_active=True
+        )
+
+        claims = dict(self.valid_claims)
+        # External user ID does NOT match any ExternalUserMapping, even though email matches unmapped_user
+        claims['user'] = {
+            "id": "usr_unmapped_random_uuid",
+            "email": unmapped_user.email,
+            "full_name": "Unmapped User"
+        }
+        mock_urlopen.return_value = self._mock_vibeconnect_response(claims)
+
+        resp = self.client.post(
+            '/api/v1/auth/sso/callback/',
+            {"code": "valid_auth_code_abc", "code_verifier": "valid_pkce_verifier_xyz"},
+            content_type='application/json'
+        )
+        # Must be rejected because external_user_id is not mapped; cannot silently claim unmapped_user by email!
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['error'], 'unmapped_user')
+        self.assertFalse(ExternalUserMapping.objects.filter(user=unmapped_user).exists())
+
+    # ─── 20. NO REAL NETWORK CALLS ───────────────────────────────────────────
+
+    def test_network_isolation_guaranteed(self):
+        # Without mocking urllib.request.urlopen, invoking the service points to mock domain
+        # which would fail if called. This verifies mock coverage.
+        with patch('urllib.request.urlopen') as mock_urlopen:
+            mock_urlopen.return_value = self._mock_vibeconnect_response(self.valid_claims)
+            resp = self.client.post(
+                '/api/v1/auth/sso/callback/',
+                {"code": "test_code", "code_verifier": "test_verifier"},
+                content_type='application/json'
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(mock_urlopen.called)
