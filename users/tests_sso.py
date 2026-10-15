@@ -520,3 +520,357 @@ class SSOCallbackTestCase(TestCase):
             )
             self.assertEqual(resp.status_code, 200)
             self.assertTrue(mock_urlopen.called)
+
+
+@override_settings(
+    VIBECONNECT_M2M_SECRET='test-super-secret-m2m-token-12345',
+    VIBECONNECT_LAUNCH_GRANT_SECRET='test-dedicated-launch-grant-secret-67890',
+    FRONTEND_URL='http://localhost:8080'
+)
+class LaunchGrantAndExchangeTestCase(TestCase):
+    def setUp(self):
+        from organizations.models import Role
+        from master_setup.models import Workspace
+
+        admin_ws, _ = Workspace.objects.get_or_create(key='admin', defaults={'label': 'Administration', 'order': 1})
+        learner_ws, _ = Workspace.objects.get_or_create(key='learner', defaults={'label': 'Learning', 'order': 2})
+
+        # 1. Organization & Roles
+        self.org = Organization.objects.create(
+            name="Grant Test Org",
+            company_name="Grant Test Org",
+            entity_name="Grant Test Org",
+            sub_domain="grant-test-org",
+            status="Active"
+        )
+        self.inactive_org = Organization.objects.create(
+            name="Inactive Org",
+            company_name="Inactive Org",
+            entity_name="Inactive Org",
+            sub_domain="inactive-org",
+            status="Inactive"
+        )
+        self.other_org = Organization.objects.create(
+            name="Other Org",
+            company_name="Other Org",
+            entity_name="Other Org",
+            sub_domain="other-org",
+            status="Active"
+        )
+
+        self.admin_role = Role.objects.create(
+            organization=self.org,
+            name="Organization Admin",
+            is_admin_role=True,
+            is_default=True
+        )
+        self.admin_role.workspaces.set([admin_ws, learner_ws])
+
+        # 2. Users
+        self.admin_user = User.objects.create_user(
+            username="admin@grant.com",
+            email="admin@grant.com",
+            organization=self.org,
+            role=self.admin_role,
+            is_active=True
+        )
+        self.member_user = User.objects.create_user(
+            username="member@grant.com",
+            email="member@grant.com",
+            organization=self.org,
+            role=None,
+            is_active=True
+        )
+        self.inactive_user = User.objects.create_user(
+            username="inactive@grant.com",
+            email="inactive@grant.com",
+            organization=self.org,
+            is_active=False
+        )
+        self.cross_tenant_user = User.objects.create_user(
+            username="cross@other.com",
+            email="cross@other.com",
+            organization=self.other_org,
+            is_active=True
+        )
+        self.super_admin_user = User.objects.create_superuser(
+            username="superadmin@platform.com",
+            email="superadmin@platform.com",
+            password="SuperPassword123!",
+            is_platform_super_admin=True
+        )
+
+        # 3. Phase 5B Mappings
+        self.ext_tenant_id = "org_grant_uuid_001"
+        self.ext_admin_id = "usr_grant_admin_001"
+        self.ext_member_id = "usr_grant_member_002"
+        self.ext_inactive_id = "usr_grant_inactive_003"
+        self.ext_cross_id = "usr_grant_cross_004"
+        self.ext_inactive_tenant_id = "org_grant_inactive_tenant_005"
+
+        create_tenant_mapping("vibeconnect", self.ext_tenant_id, self.org)
+        create_tenant_mapping("vibeconnect", self.ext_inactive_tenant_id, self.inactive_org)
+        create_user_mapping("vibeconnect", self.ext_admin_id, self.org, self.admin_user)
+        create_user_mapping("vibeconnect", self.ext_member_id, self.org, self.member_user)
+        create_user_mapping("vibeconnect", self.ext_inactive_id, self.org, self.inactive_user)
+        create_user_mapping("vibeconnect", self.ext_cross_id, self.other_org, self.cross_tenant_user)
+
+        self.provisioning_auth = "Bearer test-super-secret-m2m-token-12345"
+        self.launch_grant_auth = "Bearer test-dedicated-launch-grant-secret-67890"
+
+    def _post_grant(self, payload, auth_header=None):
+        headers = {}
+        if auth_header is not None:
+            headers['HTTP_AUTHORIZATION'] = auth_header
+        return self.client.post(
+            '/api/v1/integration/launch-grant/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            **headers
+        )
+
+    def _post_exchange(self, code):
+        return self.client.post(
+            '/api/v1/auth/sso/vibeconnect/exchange/',
+            data=json.dumps({"code": code}),
+            content_type='application/json'
+        )
+
+    # ─── M2M Authentication Tests ────────────────────────────────────────────
+
+    def test_01_grant_requires_m2m_authentication(self):
+        resp = self._post_grant({
+            "external_tenant_id": self.ext_tenant_id,
+            "external_user_id": self.ext_admin_id
+        })
+        self.assertEqual(resp.status_code, 401)
+
+    def test_02_grant_rejects_invalid_m2m_token(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_admin_id
+            },
+            auth_header="Bearer wrong-secret"
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_02b_grant_rejects_provisioning_m2m_token_secret_isolation(self):
+        """Dedicated secret isolation: provisioning secret MUST NOT be accepted by launch-grant endpoint."""
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_admin_id
+            },
+            auth_header=self.provisioning_auth
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    # ─── Grant Creation Success & Isolation ──────────────────────────────────
+
+    def test_03_grant_creation_success_standard_admin(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_admin_id,
+                "context": "standard",
+                "target_route": "/org-admin/courses"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertIn("callback_url", data)
+        self.assertIn("http://localhost:8080/sso/vibeconnect/callback?code=", data["callback_url"])
+        self.assertEqual(data["expires_in"], 60)
+        self.assertEqual(data["context"], "standard")
+
+    def test_04_grant_creation_success_showcase_member(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_member_id,
+                "context": "showcase"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertEqual(data["context"], "showcase")
+
+    def test_05_grant_rejects_unmapped_tenant(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": "unmapped_tenant_999",
+                "external_user_id": self.ext_admin_id
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["error"], "tenant_not_found")
+
+    def test_06_grant_rejects_unmapped_user(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": "unmapped_user_999"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["error"], "user_not_found")
+
+    def test_07_grant_rejects_inactive_organization(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_inactive_tenant_id,
+                "external_user_id": self.ext_admin_id
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "account_frozen")
+
+    def test_08_grant_rejects_inactive_user(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_inactive_id
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "account_frozen")
+
+    def test_09_grant_rejects_cross_tenant_mismatch(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_cross_id  # belongs to other_org
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["error"], "conflict")
+
+    # ─── Target Route & Role Boundary Tests ──────────────────────────────────
+
+    def test_09b_learner_cannot_request_admin_target_route(self):
+        """A non-admin learner requesting /org-admin has target_route scrubbed to empty."""
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_member_id,
+                "target_route": "/org-admin/roles"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 201)
+        code = resp.json()["callback_url"].split("code=")[1]
+        exch_resp = self._post_exchange(code)
+        self.assertEqual(exch_resp.status_code, 200)
+        self.assertIsNone(exch_resp.json()["target_route"])
+
+    def test_09c_superadmin_target_route_strictly_prohibited(self):
+        """Any request for /super-admin is stripped for security."""
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_admin_id,
+                "target_route": "/super-admin/dashboard"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 201)
+        code = resp.json()["callback_url"].split("code=")[1]
+        exch_resp = self._post_exchange(code)
+        self.assertEqual(exch_resp.status_code, 200)
+        self.assertIsNone(exch_resp.json()["target_route"])
+
+    def test_09d_external_target_route_strictly_prohibited(self):
+        """External URL or protocol-relative target routes are stripped."""
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_admin_id,
+                "target_route": "https://evil.com/phish"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 201)
+        code = resp.json()["callback_url"].split("code=")[1]
+        exch_resp = self._post_exchange(code)
+        self.assertEqual(exch_resp.status_code, 200)
+        self.assertIsNone(exch_resp.json()["target_route"])
+
+    # ─── Code Exchange & Session Tests ───────────────────────────────────────
+
+    def test_10_exchange_success_issues_jwt_tokens(self):
+        grant_resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_admin_id,
+                "target_route": "/org-admin"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        callback_url = grant_resp.json()["callback_url"]
+        code = callback_url.split("code=")[1]
+
+        # Exchange code
+        exch_resp = self._post_exchange(code)
+        self.assertEqual(exch_resp.status_code, 200)
+        data = exch_resp.json()
+        self.assertIn("access", data)
+        self.assertIn("refresh", data)
+        self.assertEqual(data["target_route"], "/org-admin")
+        self.assertEqual(data["user"]["id"], self.admin_user.id)
+        self.assertTrue(data["user"]["role"]["is_admin_role"])
+        self.assertFalse(data["user"]["is_platform_super_admin"])
+
+    def test_11_exchange_single_use_atomic_replay_protection(self):
+        grant_resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_member_id
+            },
+            auth_header=self.launch_grant_auth
+        )
+        code = grant_resp.json()["callback_url"].split("code=")[1]
+
+        # First redemption must succeed
+        exch_resp1 = self._post_exchange(code)
+        self.assertEqual(exch_resp1.status_code, 200)
+
+        # Replay must be rejected with HTTP 400
+        exch_resp2 = self._post_exchange(code)
+        self.assertEqual(exch_resp2.status_code, 400)
+        self.assertEqual(exch_resp2.json()["error"], "grant_already_consumed")
+
+    def test_12_exchange_rejects_expired_grant(self):
+        import hashlib
+        from datetime import timedelta
+        from django.utils import timezone
+        from organizations.models import LmsLaunchGrant
+
+        code = "expired_secret_code_123"
+        code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
+        past_time = timezone.now() - timedelta(seconds=10)
+
+        LmsLaunchGrant.objects.create(
+            code_hash=code_hash,
+            organization=self.org,
+            user=self.member_user,
+            is_consumed=False,
+            expires_at=past_time
+        )
+
+        exch_resp = self._post_exchange(code)
+        self.assertEqual(exch_resp.status_code, 400)
+        self.assertEqual(exch_resp.json()["error"], "grant_expired")
+
+    def test_13_exchange_rejects_bogus_code(self):
+        exch_resp = self._post_exchange("non_existent_code_99999")
+        self.assertEqual(exch_resp.status_code, 400)
+        self.assertEqual(exch_resp.json()["error"], "invalid_grant")
+

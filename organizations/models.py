@@ -381,3 +381,37 @@ class ExternalUserMapping(models.Model):
     def __str__(self):
         return f"{self.provider}:{self.external_user_id} -> User {self.user_id} ({self.user.username})"
 
+
+class LmsLaunchGrant(models.Model):
+    """
+    Transient, single-use launch grant for VibeConnect-initiated SSO.
+    Stores the SHA-256 hash of a cryptographically secure one-time code.
+    Valid for ~60 seconds and atomically consumed during exchange.
+    """
+    code_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    organization = models.ForeignKey(
+        'organizations.Organization',
+        on_delete=models.CASCADE,
+        related_name='launch_grants'
+    )
+    user = models.ForeignKey(
+        'users.User',
+        on_delete=models.CASCADE,
+        related_name='launch_grants'
+    )
+    context = models.CharField(max_length=50, default='standard')  # 'standard' or 'showcase'
+    target_route = models.CharField(max_length=255, blank=True, default='')
+    is_consumed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    consumed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'lms_launch_grant'
+        indexes = [
+            models.Index(fields=['code_hash', 'is_consumed', 'expires_at']),
+        ]
+
+    def __str__(self):
+        return f"LaunchGrant(user={self.user_id}, org={self.organization_id}, consumed={self.is_consumed})"
+

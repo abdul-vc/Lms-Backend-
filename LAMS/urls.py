@@ -31,7 +31,7 @@ import courses.admin
 import authoring_engine.admin
 import import_engine.admin
 admin.autodiscover()
-from users.sso_views import SSOCallbackView
+from users.sso_views import SSOCallbackView, VibeConnectExchangeView
 def stream_video_file(request, file_path):
     import os
     import re
@@ -163,6 +163,7 @@ def serve_media_video(request, path):
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/auth/sso/callback/', SSOCallbackView.as_view(), name='api-v1-sso-callback'),
+    path('api/v1/auth/sso/vibeconnect/exchange/', VibeConnectExchangeView.as_view(), name='api-v1-sso-vibeconnect-exchange'),
     path('api/v1/integration/', include('organizations.integration_urls')),
     path('api/users/', include('users.urls')),
     path('api/', include('organizations.urls')),
