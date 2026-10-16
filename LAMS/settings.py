@@ -89,8 +89,6 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
 ]
 
-X_FRAME_OPTIONS = 'SAMEORIGIN'
-
 ROOT_URLCONF = 'LAMS.urls'
 
 TEMPLATES = [
@@ -206,3 +204,7 @@ VIBECONNECT_M2M_SECRET = os.getenv('VIBECONNECT_LMS_M2M_SECRET') or os.getenv('V
 VIBECONNECT_LAUNCH_GRANT_SECRET = os.getenv('VIBECONNECT_LAUNCH_GRANT_SECRET', '')
 VIBECONNECT_SSO_AUDIENCE = os.getenv('VIBECONNECT_SSO_AUDIENCE', 'vibeconnect-lms')
 VIBECONNECT_HTTP_TIMEOUT = int(os.getenv('VIBECONNECT_HTTP_TIMEOUT', 10))
+
+# Showcase Platform Superadmin Configuration
+LMS_SHOWCASE_SUPERADMIN_EMAIL = os.getenv('LMS_SHOWCASE_SUPERADMIN_EMAIL', 'superadmin@gmail.com').strip().lower()
+LMS_SHOWCASE_SUPERADMIN_PASSWORD = os.getenv('LMS_SHOWCASE_SUPERADMIN_PASSWORD', '')

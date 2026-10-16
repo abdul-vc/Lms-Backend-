@@ -3,6 +3,7 @@ import urllib.error
 from unittest.mock import patch, MagicMock
 from io import BytesIO
 
+from django.conf import settings
 from django.test import TestCase, override_settings
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.tokens import AccessToken
@@ -593,10 +594,12 @@ class LaunchGrantAndExchangeTestCase(TestCase):
             organization=self.other_org,
             is_active=True
         )
+        showcase_superadmin_email = getattr(settings, 'LMS_SHOWCASE_SUPERADMIN_EMAIL', 'superadmin@gmail.com').strip().lower()
         self.super_admin_user = User.objects.create_superuser(
-            username="superadmin@platform.com",
-            email="superadmin@platform.com",
+            username=showcase_superadmin_email,
+            email=showcase_superadmin_email,
             password="SuperPassword123!",
+            organization=self.org,
             is_platform_super_admin=True
         )
 
@@ -607,6 +610,7 @@ class LaunchGrantAndExchangeTestCase(TestCase):
         self.ext_inactive_id = "usr_grant_inactive_003"
         self.ext_cross_id = "usr_grant_cross_004"
         self.ext_inactive_tenant_id = "org_grant_inactive_tenant_005"
+        self.ext_super_admin_id = "usr_grant_super_006"
 
         create_tenant_mapping("vibeconnect", self.ext_tenant_id, self.org)
         create_tenant_mapping("vibeconnect", self.ext_inactive_tenant_id, self.inactive_org)
@@ -614,6 +618,7 @@ class LaunchGrantAndExchangeTestCase(TestCase):
         create_user_mapping("vibeconnect", self.ext_member_id, self.org, self.member_user)
         create_user_mapping("vibeconnect", self.ext_inactive_id, self.org, self.inactive_user)
         create_user_mapping("vibeconnect", self.ext_cross_id, self.other_org, self.cross_tenant_user)
+        create_user_mapping("vibeconnect", self.ext_super_admin_id, self.org, self.super_admin_user)
 
         self.provisioning_auth = "Bearer test-super-secret-m2m-token-12345"
         self.launch_grant_auth = "Bearer test-dedicated-launch-grant-secret-67890"
@@ -685,7 +690,26 @@ class LaunchGrantAndExchangeTestCase(TestCase):
         self.assertEqual(data["expires_in"], 60)
         self.assertEqual(data["context"], "standard")
 
-    def test_04_grant_creation_success_showcase_member(self):
+    def test_04_grant_creation_success_showcase_superadmin(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_super_admin_id,
+                "context": "showcase",
+                "target_route": "/super-admin/dashboard"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertEqual(data["context"], "showcase")
+        code = data["callback_url"].split("code=")[1]
+        exch = self._post_exchange(code)
+        self.assertEqual(exch.status_code, 200)
+        self.assertEqual(exch.json()["target_route"], "/super-admin/dashboard")
+        self.assertTrue(exch.json()["user"]["is_platform_super_admin"])
+
+    def test_04b_grant_rejects_showcase_for_non_superadmin(self):
         resp = self._post_grant(
             {
                 "external_tenant_id": self.ext_tenant_id,
@@ -694,9 +718,20 @@ class LaunchGrantAndExchangeTestCase(TestCase):
             },
             auth_header=self.launch_grant_auth
         )
-        self.assertEqual(resp.status_code, 201)
-        data = resp.json()
-        self.assertEqual(data["context"], "showcase")
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "forbidden")
+
+    def test_04c_grant_rejects_standard_tenant_launch_for_superadmin(self):
+        resp = self._post_grant(
+            {
+                "external_tenant_id": self.ext_tenant_id,
+                "external_user_id": self.ext_super_admin_id,
+                "context": "standard"
+            },
+            auth_header=self.launch_grant_auth
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"], "forbidden")
 
     def test_05_grant_rejects_unmapped_tenant(self):
         resp = self._post_grant(

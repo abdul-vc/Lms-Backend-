@@ -161,21 +161,29 @@ def create_user_mapping(provider: str, external_user_id: str, organization: Orga
     if not user or not getattr(user, 'pk', None):
         raise MappingValidationError("A valid, saved User instance is required.")
 
+    # Platform super admins:
+    # A global super admin with no organization cannot be mapped to a tenant identity.
+    # An account converted from a tenant admin (retaining organization_id) can be mapped to its organization (e.g. showcase demo).
     if getattr(user, 'is_platform_super_admin', False):
-        raise MappingValidationError(
-            f"User {user.id} is a Platform Super Admin and cannot be mapped to a tenant external user identity."
-        )
-
-    if getattr(user, 'organization_id', None) is None:
-        raise MappingValidationError(
-            f"User {user.id} has no associated organization and cannot be mapped."
-        )
-
-    if user.organization_id != organization.id:
-        raise MappingValidationError(
-            f"Tenant isolation mismatch: User {user.id} belongs to Organization {user.organization_id}, "
-            f"cannot map to Organization {organization.id}."
-        )
+        if getattr(user, 'organization_id', None) is None:
+            raise MappingValidationError(
+                f"User {user.id} is a Platform Super Admin and cannot be mapped to a tenant external user identity."
+            )
+        if user.organization_id != organization.id:
+            raise MappingValidationError(
+                f"Tenant isolation mismatch: User {user.id} belongs to Organization {user.organization_id}, "
+                f"cannot map to Organization {organization.id}."
+            )
+    else:
+        if getattr(user, 'organization_id', None) is None:
+            raise MappingValidationError(
+                f"User {user.id} has no associated organization and cannot be mapped."
+            )
+        if user.organization_id != organization.id:
+            raise MappingValidationError(
+                f"Tenant isolation mismatch: User {user.id} belongs to Organization {user.organization_id}, "
+                f"cannot map to Organization {organization.id}."
+            )
 
     try:
         with transaction.atomic():

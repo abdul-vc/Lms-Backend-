@@ -392,44 +392,84 @@ class LaunchGrantView(APIView):
             )
 
         # 3. Resolve User Mapping
-        user_mapping = lookup_user_mapping(provider='vibeconnect', external_user_id=norm_user_id)
-        if not user_mapping or not user_mapping.user:
-            return Response(
-                {
-                    "error": "user_not_found",
-                    "detail": f"User '{norm_user_id}' is not provisioned in LMS. Provision user first."
-                },
-                status=status.HTTP_404_NOT_FOUND
-            )
+        if context == 'showcase':
+            # Resolve designated Showcase Superadmin account via trusted server configuration
+            designated_email = (
+                getattr(settings, 'LMS_SHOWCASE_SUPERADMIN_EMAIL', '')
+                or os.getenv('LMS_SHOWCASE_SUPERADMIN_EMAIL', 'superadmin@gmail.com')
+            ).strip().lower()
 
-        user = user_mapping.user
+            user_mapping = lookup_user_mapping(provider='vibeconnect', external_user_id=norm_user_id)
+            if user_mapping and user_mapping.user and not user_mapping.user.is_platform_super_admin:
+                return Response(
+                    {"error": "forbidden", "detail": "Showcase launch requires designated platform super administrator identity."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
-        # Platform super admin safety protection
-        if getattr(user, 'is_platform_super_admin', False):
-            return Response(
-                {"error": "forbidden", "detail": "Platform super administrators cannot be launched via launch grant."},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            user = None
+            if user_mapping and user_mapping.user and user_mapping.user.is_platform_super_admin and (not designated_email or user_mapping.user.email.lower() == designated_email):
+                user = user_mapping.user
+            else:
+                user = (
+                    User.objects.filter(email__iexact=designated_email).first()
+                    or User.objects.filter(username__iexact=designated_email).first()
+                )
 
-        if not getattr(user, 'is_active', False):
-            return Response(
-                {"error": "account_frozen", "detail": "User account is inactive. Kindly contact admin for assistance."},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            if not user or not user.is_platform_super_admin:
+                return Response(
+                    {"error": "forbidden", "detail": "Showcase launch requires designated platform super administrator identity."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
-        # 4. Strict Tenant Isolation Invariant
-        if user_mapping.organization_id != org.id or user.organization_id != org.id:
-            logger.error(
-                f"Tenant isolation mismatch during launch grant: User {user.id} belongs to Org "
-                f"{user.organization_id}, but requested tenant maps to Org {org.id}."
-            )
-            return Response(
-                {
-                    "error": "conflict",
-                    "detail": "Cross-tenant isolation violation: User organization does not match the requested tenant."
-                },
-                status=status.HTTP_409_CONFLICT
-            )
+            if not getattr(user, 'is_active', False):
+                return Response(
+                    {"error": "account_frozen", "detail": "User account is inactive. Kindly contact admin for assistance."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            is_super_admin = True
+        else:
+            user_mapping = lookup_user_mapping(provider='vibeconnect', external_user_id=norm_user_id)
+            if not user_mapping or not user_mapping.user:
+                return Response(
+                    {
+                        "error": "user_not_found",
+                        "detail": f"User '{norm_user_id}' is not provisioned in LMS. Provision user first."
+                    },
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            user = user_mapping.user
+
+            if not getattr(user, 'is_active', False):
+                return Response(
+                    {"error": "account_frozen", "detail": "User account is inactive. Kindly contact admin for assistance."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            # 4. Platform Superadmin & Role Boundaries by Launch Context
+            is_super_admin = getattr(user, 'is_platform_super_admin', False)
+
+            # Standard tenant launch: Platform super administrators can NEVER be launched via tenant SSO
+            if is_super_admin:
+                return Response(
+                    {"error": "forbidden", "detail": "Platform super administrators cannot be launched via tenant launch grant."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            # Strict Tenant Isolation Invariant for standard tenant users
+            if user_mapping.organization_id != org.id or user.organization_id != org.id:
+                logger.error(
+                    f"Tenant isolation mismatch during launch grant: User {user.id} belongs to Org "
+                    f"{user.organization_id}, but requested tenant maps to Org {org.id}."
+                )
+                return Response(
+                    {
+                        "error": "conflict",
+                        "detail": "Cross-tenant isolation violation: User organization does not match the requested tenant."
+                    },
+                    status=status.HTTP_409_CONFLICT
+                )
 
         # 5. Validate Target Route and Role Boundary
         clean_target_route = ''
@@ -438,18 +478,27 @@ class LaunchGrantView(APIView):
             # Must be a relative path, no protocol-relative or external URLs (e.g. //evil.com or https://)
             if candidate.startswith('/') and not candidate.startswith('//') and '\\' not in candidate:
                 is_admin = bool(user.role and getattr(user.role, 'is_admin_role', False))
-                # Super-admin routes are strictly prohibited
-                if candidate.startswith('/super-admin') or candidate.startswith('/admin'):
+                # Super-admin routes are permitted ONLY for platform superadmin in showcase context
+                if candidate.startswith('/super-admin'):
+                    if is_super_admin and context == 'showcase':
+                        clean_target_route = candidate
+                    else:
+                        clean_target_route = ''
+                elif candidate.startswith('/admin'):
                     clean_target_route = ''
                 # Org-admin routes only permitted if user actually has an admin role
                 elif any(candidate == prefix or candidate.startswith(f"{prefix}/") for prefix in self.ADMIN_ROUTE_PREFIXES):
-                    if is_admin:
+                    if is_admin or is_super_admin:
                         clean_target_route = candidate
                     else:
                         clean_target_route = ''  # Non-admin cannot receive admin route
                 # Safe learner routes
                 elif any(candidate == prefix or candidate.startswith(prefix) for prefix in self.SAFE_ROUTE_PREFIXES):
                     clean_target_route = candidate
+
+        # Default route for showcase platform superadmin
+        if is_super_admin and context == 'showcase' and not clean_target_route:
+            clean_target_route = '/super-admin/dashboard'
 
         # 6. Generate high-entropy one-time code and store cryptographic hash
         code = secrets.token_urlsafe(32)

@@ -189,8 +189,8 @@ class VibeConnectExchangeView(APIView):
                         status=status.HTTP_403_FORBIDDEN
                     )
 
-                # Cross-tenant invariant check
-                if user.organization_id != org.id:
+                # Cross-tenant invariant check (enforced for non-superadmin tenant users)
+                if not getattr(user, 'is_platform_super_admin', False) and user.organization_id != org.id:
                     logger.error(f"[{reference_id}] Cross-tenant violation: User {user.id} (org {user.organization_id}) != Grant Org {org.id}")
                     return Response(
                         {"error": "tenant_mismatch", "detail": "Cross-tenant isolation violation.", "reference_id": reference_id},
